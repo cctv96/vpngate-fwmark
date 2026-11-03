@@ -312,9 +312,11 @@ def update_all(args):
     grouped = candidates_by_region(servers)
     if not any(grouped.values()):
         sys.exit("拉取失败：没有符合 vpn* + 日韩条件的服务器。")
+    # TUI 要按 Mihomo 代理组显示全部节点，不能只存前 20 名，
+    # 否则组里排在后面的节点在 TUI 里永远没有 IP / 速度信息。
     with open(CANDIDATES_FILE, "w") as f:
         json.dump({r: [{k: v for k, v in s.items() if k != "config_b64"}
-                        for s in grouped[r][:20]]
+                        for s in grouped[r]]
                    for r in grouped}, f, ensure_ascii=False, indent=2)
     manual = load_json(MANUAL_FILE, {})
     check_rep = getattr(args, "check_reputation", False)
@@ -443,6 +445,46 @@ def api_current(region):
     return group.get("now")
 
 
+def parse_api_proxies(data, group_name):
+    """解析 Mihomo GET /proxies：返回 (节点列表, 当前节点名)。
+    节点列表按代理组 all 的顺序，history 取最后一次延迟（0 或空 = 未测/测不到）。
+    纯函数，方便单元测试，不联网。"""
+    proxies = (data or {}).get("proxies", {}) or {}
+    group = proxies.get(group_name, {}) or {}
+    current = group.get("now")
+    nodes = []
+    for name in group.get("all", []) or []:
+        p = proxies.get(name)
+        if not p:
+            continue
+        hist = p.get("history") or []
+        last = hist[-1].get("delay") if hist else None
+        if last == 0:
+            last = None
+        nodes.append({"name": name, "type": p.get("type", ""),
+                      "history_delay": last})
+    return nodes, current
+
+
+def api_delay(region, proxy_name_value, timeout=5):
+    """Mihomo 延迟：GET /proxies/<节点>/delay，走该节点实测一次。
+    这才是 Mihomo 逻辑的延迟——经隧道拨号后到目标站的往返，
+    和本机 ping 服务器 IP（直连、常被挡）不是一回事。
+    失败（节点已死、握手超时、DNS 失败）返回 None，不抛错。"""
+    try:
+        import urllib.parse
+        url = (controller_base(region) + "/proxies/"
+               + urllib.parse.quote(proxy_name_value, safe="")
+               + f"/delay?timeout={int(timeout * 1000)}&url=http://www.gstatic.com/generate_204")
+        req = urllib.request.Request(url)
+        with urllib.request.urlopen(req, timeout=timeout + 2) as resp:
+            data = json.load(resp)
+        delay = data.get("delay") if isinstance(data, dict) else None
+        return int(delay) if delay else None
+    except Exception:
+        return None
+
+
 def wait_controller(region, timeout=15):
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -496,14 +538,16 @@ def start_region(region):
         return _fail(f"拉起 mihomo 失败：{e}")
     if not wait_controller(region):
         return _fail("mihomo 启动后控制端口一直没响应，看日志末尾找原因")
-    # 启动后按手动指定再切一次：配置文件里手动节点虽然排在最前，
-    # 但 API 切一次最保险，避免 Mihomo 默认选了别的节点。
-    manual = load_json(MANUAL_FILE, {})
-    if manual.get(region):
-        meta = load_json(files["meta"], {})
-        if meta.get("fqdn"):
-            # 节点名 = 地区-主机名，和 build_mihomo_yaml 里一致
-            api_switch(region, f"{REGIONS[region]['code']}-{meta['fqdn']}")
+    # 启动后必须按 meta 再切一次，不能只靠“组里第一个就是默认”：
+    # 实测 Mihomo 会把上次选的节点存在缓存里（~/.config/mihomo），
+    # 重启后直接恢复上次的选择，而不是组里第一个。
+    # 用户明明已经按 a 恢复自动、meta 里是最优节点，Mihomo 却还
+    # 停在上次手动切的节点上，就是这个缓存造成的。所以不管手动
+    # 还是自动，启动后都按 meta（程序认定的当前出口）切一次，
+    # 程序才是真相来源，不是 Mihomo 缓存。
+    meta = load_json(files["meta"], {})
+    if meta.get("fqdn"):
+        api_switch(region, f"{REGIONS[region]['code']}-{meta['fqdn']}")
     return True
 
 
@@ -935,15 +979,15 @@ def cmd_tui(_args):
     import curses
 
     def load_candidates():
+        # Mihomo 适配：TUI 启动时不要在这里联网拉 VPN Gate——
+        # 网络一慢（直连被挡时 fetch 要等 30 秒超时），TUI 就卡在
+        # 黑屏上，用户连 q 都按不出去。先读本地候选文件，没有就
+        # 返回空列表：实例在跑时列表直接来自 Mihomo 代理组，
+        # 不在跑时界面会提示按 r 拉取；r / s 才是明确要联网的动作。
         cands = load_json(CANDIDATES_FILE, {})
         if cands and any(cands.values()):
             return cands
-        try:
-            grouped = candidates_by_region(parse_servers(fetch_csv()))
-        except Exception:
-            return {r: [] for r in REGIONS}
-        return {r: [{k: v for k, v in s.items() if k != "config_b64"}
-                     for s in grouped[r][:20]] for r in grouped}
+        return {r: [] for r in REGIONS}
 
     def safe_add(stdscr, y, x, text, attr=0):
         try:
@@ -1019,6 +1063,107 @@ def cmd_tui(_args):
 
         threading.Thread(target=_work, daemon=True).start()
 
+    # ---- Mihomo 实时状态 ----
+    # 旧 TUI 的问题：当前出口读的是 meta 文件（上次生成配置时的记录），
+    # 列表是 VPN Gate 候选前 20 名，延迟是本机 ping 服务器 IP。
+    # 这三样都不是 Mihomo 眼里的状态：用户在面板 / 其它工具里切了节点，
+    # TUI 里还是旧的；节点死了，本地 ping 也可能还通。
+    # 新逻辑：列表 = Mihomo 代理组的 all（实时），当前 = 组的 now（实时），
+    # 延迟 = Mihomo /delay 走该节点实测。API 结果缓存 2 秒，避免每 500ms
+    # 重画就打两次控制端口；实例没起时回落到候选列表 + 本地延迟。
+    api_cache = {}
+    display_holder = {"lists": {}, "states": {}}
+
+    def refresh_api(region, force=False):
+        if not pid_running(region):
+            api_cache[region] = None
+            return None
+        cached = api_cache.get(region)
+        if cached and not force and time.time() - cached["time"] < 2:
+            return cached
+        data = api_get(region, "/proxies", timeout=2)
+        if not data:
+            api_cache[region] = None
+            return None
+        nodes, current = parse_api_proxies(data, REGIONS[region]["group"])
+        conns_data = api_get(region, "/connections", timeout=2)
+        # 没连接时 Mihomo 返回 connections: null，不是 []，直接 len 会崩。
+        conns = len(conns_data.get("connections") or []) if conns_data else None
+        state = {"time": time.time(), "nodes": nodes, "current": current, "conns": conns}
+        api_cache[region] = state
+        return state
+
+    def build_display(region, cand_list):
+        """把候选列表 + Mihomo 实时状态拼成 TUI 要显示的列表。
+        每项统一字段：name（Mihomo 节点名）、fqdn、ip、speed_mbps、
+        sessions、ping、current（是不是组里当前节点）。"""
+        by_fqdn = {s["fqdn"]: s for s in cand_list}
+        state = refresh_api(region)
+        if state is None:
+            meta = load_json(region_files(region)["meta"], {})
+            out = []
+            for s in cand_list:
+                item = dict(s)
+                item["name"] = proxy_name(s)
+                item["current"] = (s["fqdn"] == meta.get("fqdn"))
+                out.append(item)
+            return out
+        out = []
+        for node in state["nodes"]:
+            name = node["name"]
+            fqdn = name[len(REGIONS[region]["code"]) + 1:] if name.startswith(REGIONS[region]["code"] + "-") else name
+            base = by_fqdn.get(fqdn, {})
+            out.append({
+                "name": name, "fqdn": fqdn,
+                "ip": base.get("ip", ""), "speed_mbps": base.get("speed_mbps", ""),
+                "sessions": base.get("sessions", ""), "ping": base.get("ping", ""),
+                "current": (name == state["current"]),
+                "history_delay": node.get("history_delay"),
+            })
+        return out
+
+    def build_all_display(cand_dict):
+        lists, states = {}, {}
+        for r in REGIONS:
+            lists[r] = build_display(r, cand_dict.get(r, []))
+            states[r] = api_cache.get(r)
+        display_holder["lists"] = lists
+        display_holder["states"] = states
+        return lists
+
+    delay_scores = {}
+    delay_pending = set()
+    delay_lock = threading.Lock()
+    delay_sem = threading.Semaphore(3)
+
+    def delay_text(name):
+        with delay_lock:
+            if name in delay_scores:
+                return delay_scores[name]
+            return "Mihomo延迟 …" if name in delay_pending else "Mihomo延迟 未测"
+
+    def ensure_mihomo_delay(name, region):
+        with delay_lock:
+            if name in delay_scores or name in delay_pending:
+                return
+            delay_pending.add(name)
+
+        def _work():
+            try:
+                with delay_sem:
+                    ms = api_delay(region, name, timeout=5)
+                text = f"Mihomo延迟 {ms} ms" if ms is not None else "Mihomo延迟 测不到"
+                with delay_lock:
+                    delay_scores[name] = text
+            except Exception:
+                with delay_lock:
+                    delay_scores[name] = "Mihomo延迟 测不到"
+            finally:
+                with delay_lock:
+                    delay_pending.discard(name)
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def fraud_text(ip):
         with rep_lock:
             if ip in rep_scores:
@@ -1050,6 +1195,12 @@ def cmd_tui(_args):
         threading.Thread(target=_work, daemon=True).start()
 
     def draw(stdscr, regions, sel_region, cursor, cands, manual, msg):
+        # cands 在这里是原始候选列表；显示列表由 build_all_display
+        # 从 Mihomo 实时状态拼出来，并存进 display_holder 供按键处理用。
+        # 这样 draw 每次重画（500ms）都会刷新当前节点，面板里切了节点
+        # TUI 里下一秒就能看到，不再只看 meta 文件。
+        display = build_all_display(cands)
+        states = display_holder["states"]
         stdscr.clear()
         try:
             height, width = stdscr.getmaxyx()
@@ -1071,23 +1222,38 @@ def cmd_tui(_args):
             safe_add(stdscr, row, 0, head, head_attr)
             safe_add(stdscr, row, max(0, width - 12), status, status_attr)
             row += 1
-            safe_add(stdscr, row, 2,
-                     f"当前出口 IP：{meta.get('ip', '（无）')}（{meta.get('fqdn', '')}） "
-                     f"{meta.get('speed_mbps', '')} Mbps / Ping {meta.get('ping', '')} ms")
+            lst_r = display.get(region, [])
+            cur_node = next((s for s in lst_r if s.get("current")), None)
+            if cur_node:
+                cur_line = (f"当前（Mihomo 实时）：{cur_node.get('ip') or 'IP未知'}（{cur_node.get('fqdn', '')}） "
+                            f"{cur_node.get('speed_mbps', '')} Mbps")
+            else:
+                cur_line = (f"当前出口 IP：{meta.get('ip', '（无）')}（{meta.get('fqdn', '')}） "
+                            f"{meta.get('speed_mbps', '')} Mbps / Ping {meta.get('ping', '')} ms")
+            state = states.get(region)
+            if state and state.get("conns") is not None:
+                cur_line += f" · 连接 {state['conns']} · 节点 {len(lst_r)}"
+            elif lst_r:
+                cur_line += f" · 节点 {len(lst_r)}"
+            safe_add(stdscr, row, 2, cur_line)
             row += 1
             safe_add(stdscr, row, 0, "─" * max(0, width - 1), curses.color_pair(5))
             row += 1
         footer_rows = 3
         avail = max(1, height - row - footer_rows - 1)
         region = regions[sel_region]
-        lst = cands.get(region, [])
+        lst = display.get(region, [])
         clamp_cursor(cursor, region, lst)
-        safe_add(stdscr, row, 0,
-                 f"候选服务器 · {REGIONS[region]['name']}（回车即切节点，不用重启；欺诈分在每行后面，后台自动查，p 查详情）",
-                 curses.A_BOLD)
+        if pid_running(region):
+            list_title = (f"代理组 {REGIONS[region]['group']} · Mihomo 实时状态（● 为当前节点，"
+                          f"延迟为走该节点实测，p 查信誉，u 测速选最快）")
+        else:
+            list_title = (f"候选服务器 · {REGIONS[region]['name']}（实例未运行，延迟为本地实测，"
+                          f"按 s 启动后改为 Mihomo 实时状态）")
+        safe_add(stdscr, row, 0, list_title, curses.A_BOLD)
         row += 1
         if not lst:
-            safe_add(stdscr, row, 2, "暂无候选，按 r 刷新列表。")
+            safe_add(stdscr, row, 2, "暂无节点，按 r 刷新列表。")
         else:
             cur = cursor[region]
             start = 0
@@ -1096,17 +1262,34 @@ def cmd_tui(_args):
             for ci, s in enumerate(lst[start:start + avail]):
                 real = start + ci
                 mark = ">>" if real == cur else "  "
+                cur_mark = "●" if s.get("current") else " "
                 attr = curses.color_pair(2) if real == cur else 0
-                ensure_rep(s["ip"], region)
-                ensure_lat(s["ip"])
+                if s.get("ip"):
+                    ensure_rep(s["ip"], region)
+                    fraud = fraud_text(s["ip"])
+                else:
+                    fraud = "欺诈 未知"
+                if pid_running(region):
+                    # Mihomo 延迟优先用组里已有的 history，没有才后台实测
+                    if s.get("history_delay") and s["name"] not in delay_scores:
+                        with delay_lock:
+                            delay_scores[s["name"]] = f"Mihomo延迟 {s['history_delay']} ms"
+                    ensure_mihomo_delay(s["name"], region)
+                    latency = delay_text(s["name"])
+                else:
+                    if s.get("ip"):
+                        ensure_lat(s["ip"])
+                        latency = lat_text(s["ip"])
+                    else:
+                        latency = "本地延迟 未知"
                 safe_add(stdscr, row, 2,
-                         f"{mark} {s['ip']:<15}  {s['fqdn']:<28} "
-                         f"{s['speed_mbps']:>7} Mbps  {lat_text(s['ip'])}  {s['sessions']} 会话  {fraud_text(s['ip'])}",
+                         f"{mark} {cur_mark} {s.get('ip') or '-':<15}  {s['fqdn']:<28} "
+                         f"{s.get('speed_mbps', '')} Mbps  {latency}  {s.get('sessions', '')} 会话  {fraud}",
                          attr)
                 row += 1
         safe_add(stdscr, height - 3, 0, "─" * max(0, width - 1), curses.color_pair(5))
         safe_add(stdscr, height - 2, 0,
-                 "Tab 切换地区  ↑/↓选服务器  回车手动指定  a 自动  p 信誉  r 刷新  s 启停  c 系统检查  l 看日志  q 退出")
+                 "Tab 切换  ↑/↓选  回车切节点  a 自动  u 测速选最快  p 信誉  r 刷新  s 启停  c 检查  l 日志  q 退出")
         safe_add(stdscr, height - 1, 0, str(msg)[: max(0, width - 1)])
         try:
             stdscr.refresh()
@@ -1142,7 +1325,7 @@ def cmd_tui(_args):
         for r in regions:
             cands.setdefault(r, [])
         msg = ("系统检查没过：" + "；".join(f"{n}：{d}" for _, n, d in _crit) + "，按 c 看完整检查。"
-               if _crit else ("已加载候选列表。" if any(cands.values()) else "候选列表拉取失败，按 r 重试。"))
+               if _crit else ("已加载候选列表。" if any(cands.values()) else "本地候选未加载，按 r 刷新；实例在跑时列表直接来自 Mihomo 代理组。"))
         draw(stdscr, regions, sel, cursor, cands, manual, msg)
         while True:
             key = stdscr.getch()
@@ -1159,10 +1342,10 @@ def cmd_tui(_args):
             elif key in (curses.KEY_UP, ord("k")):
                 cursor[region] = max(0, cursor[region] - 1)
             elif key in (curses.KEY_DOWN, ord("j")):
-                lst = cands.get(region, [])
+                lst = display_holder["lists"].get(region, []) or cands.get(region, [])
                 cursor[region] = min(max(0, len(lst) - 1), cursor[region] + 1)
             elif key in (curses.KEY_ENTER, 10, 13):
-                lst = cands.get(region, [])
+                lst = display_holder["lists"].get(region, []) or cands.get(region, [])
                 clamp_cursor(cursor, region, lst)
                 if lst:
                     chosen = lst[cursor[region]]
@@ -1171,13 +1354,18 @@ def cmd_tui(_args):
                     manual[region] = chosen["fqdn"]
                     with open(MANUAL_FILE, "w") as f:
                         json.dump(manual, f, ensure_ascii=False, indent=2)
-                    if pid_running(region) and api_switch(region, proxy_name(chosen)):
+                    # 显示列表里节点名就是 Mihomo 的名字，直接用它切，
+                    # 不用再从 fqdn 拼一次（拼错一个字就会切失败）。
+                    _node_name = chosen.get("name") or proxy_name(chosen)
+                    if pid_running(region) and api_switch(region, _node_name):
                         meta = load_json(region_files(region)["meta"], {})
-                        meta.update({k: v for k, v in chosen.items() if k != "config_b64"})
+                        for _k in ("fqdn", "ip", "speed_mbps", "ping", "sessions", "country"):
+                            if chosen.get(_k) not in (None, ""):
+                                meta[_k] = chosen[_k]
                         meta["mode"] = "manual"
                         with open(region_files(region)["meta"], "w") as f:
                             json.dump(meta, f, ensure_ascii=False, indent=2)
-                        msg = f"{REGIONS[region]['name']}已手动切换到 {chosen['ip']}（{chosen['fqdn']}），API 即切。"
+                        msg = f"{REGIONS[region]['name']}已手动切换到 {chosen.get('ip') or ''}（{chosen['fqdn']}），API 即切。"
                     else:
                         try:
                             grouped = candidates_by_region(parse_servers(fetch_csv()))
@@ -1225,35 +1413,79 @@ def cmd_tui(_args):
                         check_reputation = False
                     grouped = update_all(_A())
                     cands = {r: [{k: v for k, v in s.items() if k != "config_b64"}
-                                 for s in grouped[r][:20]] for r in grouped}
+                                 for s in grouped[r]] for r in grouped}
                     for r in regions:
                         cands.setdefault(r, [])
                         clamp_cursor(cursor, r, cands[r])
+                    api_cache.clear()
+                    with delay_lock:
+                        delay_scores.clear()
                     msg = "列表已刷新，在跑的实例已重启加载新配置。"
                 except Exception as e:
                     msg = f"刷新失败：{e}"
+            elif key in (ord("u"), ord("U")):
+                # Mihomo 测速选最快：不是看 CSV 速度、不是看本地 ping，
+                # 而是看已经走各节点实测出来的 Mihomo 延迟里最小的那个。
+                # 还没测完就先触发测速，告诉用户过几秒再按一次 u。
+                lst = display_holder["lists"].get(region, []) or cands.get(region, [])
+                if not pid_running(region):
+                    msg = "实例未运行，先按 s 启动，启动后才能用 Mihomo 测速。"
+                elif not lst:
+                    msg = "暂无节点，按 r 刷新后再测。"
+                else:
+                    for _s in lst:
+                        ensure_mihomo_delay(_s["name"], region)
+                    import re as _re
+                    best, best_ms = None, None
+                    for _s in lst:
+                        _t = delay_scores.get(_s["name"], "")
+                        _m = _re.search(r"(\d+) ms", _t)
+                        if _m and (best_ms is None or int(_m.group(1)) < best_ms):
+                            best, best_ms = _s, int(_m.group(1))
+                    if not best:
+                        msg = "正在走各节点实测 Mihomo 延迟，几秒后按 u 再切（测不到的节点不会被选）。"
+                    elif api_switch(region, best["name"]):
+                        manual[region] = best["fqdn"]
+                        with open(MANUAL_FILE, "w") as f:
+                            json.dump(manual, f, ensure_ascii=False, indent=2)
+                        msg = f"{REGIONS[region]['name']}已手动切换到测速最快：{best.get('ip') or ''}（{best['fqdn']}，Mihomo延迟 {best_ms} ms）。"
+                    else:
+                        msg = "测速选最快切换失败，控制端口可能没响应。"
             elif key in (ord("p"), ord("P")):
-                lst = cands.get(region, [])
+                lst = display_holder["lists"].get(region, []) or cands.get(region, [])
                 clamp_cursor(cursor, region, lst)
                 if lst:
                     chosen = lst[cursor[region]]
-                    msg = f"正在查 {chosen['ip']} 的信誉……"
-                    draw(stdscr, regions, sel, cursor, cands, manual, msg)
-                    try:
-                        _ms, _m = measure_local_latency(chosen["ip"])
-                        _local = f"{_ms:.0f} ms" if _ms is not None else "测不到"
-                        rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy,
-                                                  via_region=region if pid_running(region) else None)
-                        with rep_lock:
-                            rep_scores[chosen["ip"]] = (
-                                f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
-                                else "欺诈 未知")
-                        msg = (f"IP {rep['ip']} 本地延迟 {_local}（官方Ping {chosen.get('ping')} ms） "
-                               f"信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or ''}） "
-                               f"滥用分 {rep.get('abuse_score')} 代理 {rep.get('proxy')} 机房 {rep.get('hosting')} "
-                               f"ISP {rep.get('isp') or ''}")
-                    except Exception as e:
-                        msg = f"信誉检查失败：{e}"
+                    _ip = chosen.get("ip") or ""
+                    if not _ip:
+                        # 代理组里的节点如果不在候选前列，IP 可能未知：
+                        # 试着解析它的主机名（opengw.net 解析结果就是出口 IP）。
+                        try:
+                            import socket as _socket
+                            _ip = _socket.gethostbyname(chosen["fqdn"])
+                        except Exception:
+                            _ip = ""
+                    if not _ip:
+                        msg = "该节点 IP 未知，先按 r 刷新候选列表再查。"
+                    else:
+                        msg = f"正在查 {_ip} 的信誉……"
+                        draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                        try:
+                            _ms, _m = measure_local_latency(_ip)
+                            _local = f"{_ms:.0f} ms" if _ms is not None else "测不到"
+                            _mi = delay_scores.get(chosen.get("name", ""), "未测")
+                            rep = check_ip_reputation(_ip, proxy=rep_proxy,
+                                                      via_region=region if pid_running(region) else None)
+                            with rep_lock:
+                                rep_scores[_ip] = (
+                                    f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
+                                    else "欺诈 未知")
+                            msg = (f"IP {rep['ip']} Mihomo延迟 {_mi} 本地延迟 {_local}（官方Ping {chosen.get('ping')} ms） "
+                                   f"信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or ''}） "
+                                   f"滥用分 {rep.get('abuse_score')} 代理 {rep.get('proxy')} 机房 {rep.get('hosting')} "
+                                   f"ISP {rep.get('isp') or ''}")
+                        except Exception as e:
+                            msg = f"信誉检查失败：{e}"
                 else:
                     msg = "暂无候选，按 r 刷新后再查。"
             elif key in (ord("c"), ord("C")):
@@ -1310,6 +1542,9 @@ def cmd_tui(_args):
             elif key in (ord("s"), ord("S")):
                 if pid_running(region):
                     stop_region(region)
+                    api_cache.pop(region, None)
+                    with delay_lock:
+                        delay_scores.clear()
                     msg = f"{REGIONS[region]['name']}实例已停止。"
                 else:
                     if not os.path.exists(region_files(region)["yaml"]):
@@ -1321,7 +1556,7 @@ def cmd_tui(_args):
                             if srv:
                                 save_region(region, grouped[region], "manual" if region in manual else "auto")
                                 cands[region] = [{k: v for k, v in s.items() if k != "config_b64"}
-                                                 for s in grouped[region][:20]]
+                                                 for s in grouped[region]]
                                 msg = f"{REGIONS[region]['name']}配置已生成（{srv['ip']}），正在启动实例……"
                             else:
                                 msg = f"{REGIONS[region]['name']}拉取列表为空，启动失败。"
@@ -1335,6 +1570,9 @@ def cmd_tui(_args):
                     if not os.path.exists(MIHOMO_BIN):
                         msg = f"{REGIONS[region]['name']}启动失败：本机没有 mihomo，先跑安装脚本。"
                     elif start_region(region):
+                        api_cache.pop(region, None)
+                        with delay_lock:
+                            delay_scores.clear()
                         with rep_lock:
                             for _s in cands.get(region, []):
                                 rep_scores.pop(_s["ip"], None)
