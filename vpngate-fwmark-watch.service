@@ -1,5 +1,5 @@
 [Unit]
-Description=VPN Gate fwmark auto-update check
+Description=VPN Gate Mihomo auto-update check
 After=network-online.target
 Wants=network-online.target
 
