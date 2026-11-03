@@ -407,21 +407,35 @@ def ensure_user(region):
 def start_region(region):
     """启动一个地区的隧道。返回 True/False，让调用方能明说失败原因，
     而不是静默地“按了 s 但状态还是未运行”。
-    False 的常见原因：openvpn 没装、ovpn 配置文件不存在。"""
+    预检失败时把原因写进日志文件本身：以前 openvpn 没装 / 没配置时，
+    openvpn 根本没被拉起来，日志文件就不存在，用户去 tail 只能看到
+    “文件不存在”，完全不知道为什么。现在至少日志里有原因。"""
     import shutil
-    if shutil.which("openvpn") is None:
-        return False
-    ensure_user(region)
     files = region_files(region)
+    os.makedirs(STATE_DIR, exist_ok=True)
+
+    def _fail(reason):
+        try:
+            with open(files["log"], "a") as f:
+                f.write(f"启动失败：{reason}\n")
+        except Exception:
+            pass
+        return False
+
+    if shutil.which("openvpn") is None:
+        return _fail("本机没有 openvpn，请跑安装脚本装依赖")
+    if not os.path.exists("/dev/net/tun"):
+        return _fail("没有 /dev/net/tun，内核/容器没给 tun 设备，隧道起不来")
     if pid_running(region):
         return True
     if not os.path.exists(files["ovpn"]):
-        return False
+        return _fail(f"配置文件不存在：{files['ovpn']}，先跑 connect 生成")
+    ensure_user(region)
     try:
         subprocess.Popen(["openvpn", "--daemon", "--config", files["ovpn"],
                           "--writepid", files["pid"], "--log", files["log"]])
-    except Exception:
-        return False
+    except Exception as e:
+        return _fail(f"拉起 openvpn 失败：{e}")
     return True
 
 
@@ -446,6 +460,15 @@ def _down_hook_for_region(region):
 def cmd_connect(args):
     need_root()
     ensure_dirs()
+    # 启动前先系统检查：openvpn / tun 缺了，隧道根本起不来，
+    # 与其假装“启动中”再让用户去找一个不存在的日志，不如直接说缺什么。
+    _critical = [c for c in system_checks()
+                 if c[1] in ("openvpn", "/dev/net/tun") and not c[0]]
+    if _critical:
+        for _ok, _name, _detail in _critical:
+            print(f"✗ {_name}：{_detail}")
+        print("系统检查没过，隧道不会启动。先修上面几项，再跑 connect。")
+        return
     cleanup_legacy()
     need_update = False
     for region in REGIONS:
@@ -473,6 +496,88 @@ def cmd_disconnect(_args):
         stop_region(region)
     cleanup_legacy()
     print("两个隧道已停，fwmark 规则与路由表 201 / 202（及旧版 101 / 102）已清理。")
+
+
+def system_checks():
+    """系统检查：启动前必须过的项，返回 [(通过?, 名称, 说明)]。
+    专门解决“按了 s 但隧道没起来、连 jp.log 都不存在”的困惑：
+    日志文件只有 openvpn 真正启动后才会创建；如果 openvpn 没装、
+    没有 /dev/net/tun、没有配置文件，openvpn 根本没被拉起来，
+    日志当然不存在——这时应该先看 doctor，而不是去 tail 一个不存在的日志。
+    所以 start_region 在预检失败时，会把失败原因写进日志文件本身，
+    让 tail 日志也能看到原因，而不是文件缺失。"""
+    import shutil
+    checks = []
+
+    def add(ok, name, detail):
+        checks.append((bool(ok), name, detail))
+
+    add(os.geteuid() == 0, "root 权限", "当前是 root" if os.geteuid() == 0 else "当前不是 root，请用 sudo")
+    ovpn = shutil.which("openvpn")
+    if ovpn:
+        ver = run(["openvpn", "--version"]).stdout.splitlines()
+        add(True, "openvpn", (ver[0].strip() if ver else ovpn))
+    else:
+        add(False, "openvpn", "未安装：跑安装脚本（apt 装 openvpn）或手动装 openvpn")
+    add(os.path.exists("/dev/net/tun"), "/dev/net/tun", "存在" if os.path.exists("/dev/net/tun") else "不存在：内核/容器没给 tun 设备，隧道起不来")
+    for cmd in ("ip", "iptables", "ping"):
+        add(shutil.which(cmd) is not None, f"命令 {cmd}", "已安装" if shutil.which(cmd) else "未安装")
+    try:
+        os.makedirs(STATE_DIR, exist_ok=True)
+        open(os.path.join(STATE_DIR, ".wtest"), "w").close()
+        add(True, "状态目录可写", STATE_DIR)
+    except Exception as e:
+        add(False, "状态目录可写", f"{STATE_DIR} 写不进去：{e}")
+    # 路由表名（install.sh 会写 /etc/iproute2/rt_tables）
+    try:
+        rt = open("/etc/iproute2/rt_tables").read() if os.path.exists("/etc/iproute2/rt_tables") else ""
+        add("201 vgjp" in rt and "202 vgkr" in rt, "路由表名 vgjp/vgkr",
+            "已注册" if ("201 vgjp" in rt and "202 vgkr" in rt) else "未注册：ip rule 会显示数字 201/202 而不是 vgjp/vgkr，功能不受影响，重装一次可补")
+    except Exception as e:
+        add(False, "路由表名 vgjp/vgkr", str(e))
+    for region, info in REGIONS.items():
+        files = region_files(region)
+        add(os.path.exists(files["ovpn"]), f"{info['name']} 配置文件",
+            files["ovpn"] if os.path.exists(files["ovpn"]) else "不存在：先跑 connect 或在 TUI 按 s（新版 s 会自动生成）")
+        add(os.path.exists(files["meta"]), f"{info['name']} 元数据",
+            "存在" if os.path.exists(files["meta"]) else "不存在")
+        pid = pid_running(region)
+        add(pid is not None, f"{info['name']} 隧道进程",
+            f"运行中 pid={pid}" if pid else "未运行")
+        add(run(["id", info["user"]]).returncode == 0, f"{info['name']} 运行用户 {info['user']}",
+            "存在" if run(["id", info["user"]]).returncode == 0 else "不存在：启动时会自动建")
+        if os.path.exists(files["log"]):
+            add(True, f"{info['name']} 日志", files["log"])
+        else:
+            add(False, f"{info['name']} 日志",
+                "不存在：openvpn 还没真正启动过——先看上面 openvpn / tun / 配置三项，缺哪项补哪项")
+    return checks
+
+
+CRITICAL_CHECKS = {"root 权限", "openvpn", "/dev/net/tun", "命令 ip", "命令 iptables", "状态目录可写"}
+
+
+def cmd_doctor(_args):
+    checks = system_checks()
+    bad = 0
+    for ok, name, detail in checks:
+        if ok:
+            mark = "✓"
+        elif name in CRITICAL_CHECKS:
+            mark = "✗"
+            bad += 1
+        else:
+            # 配置 / 进程 / 用户 / 日志 / 表名没过不是“系统坏了”，
+            # 只是还没连过：配置由 connect 生成，用户启动时自动建，
+            # 隧道没起日志当然没有。用 ○ 区分，别把 12 项都算成故障。
+            mark = "○"
+        print(f"{mark} {name}：{detail}")
+    if bad:
+        print(f"\n系统检查：{bad} 项关键问题。先修上面带 ✗ 的项再启动，"
+              f"否则隧道起不来、日志也不会有。○ 是“还没连过”，不是故障。")
+        return 1
+    print("\n系统检查：关键项全部通过，可以启动。○ 是“还没连过”，不是故障。")
+    return 0
 
 
 def cmd_status(_args):
@@ -1009,7 +1114,7 @@ def cmd_tui(_args):
         # 底栏：帮助分两行写，消息最多显示两行并截断。
         safe_add(stdscr, height - 3, 0, "─" * max(0, width - 1), curses.color_pair(5))
         safe_add(stdscr, height - 2, 0,
-                 "Tab 切换地区  ↑/↓(或j/k)选服务器  回车手动指定  a 自动  p 查信誉详情  r 刷新  s 启停  q 退出")
+                 "Tab 切换地区  ↑/↓选服务器  回车手动指定  a 自动  p 信誉  r 刷新  s 启停  c 系统检查  l 看日志  q 退出")
         safe_add(stdscr, height - 1, 0, str(msg)[: max(0, width - 1)])
         try:
             stdscr.refresh()
@@ -1036,6 +1141,10 @@ def cmd_tui(_args):
             stdscr.timeout(500)
         except Exception:
             pass
+        # 启动时先系统检查：openvpn / tun 缺了，按 s 也起不来，
+        # 直接在底栏告诉用户，别让他对着一个不存在的日志发懵。
+        _crit = [c for c in system_checks()
+                 if c[1] in ("openvpn", "/dev/net/tun") and not c[0]]
         regions = list(REGIONS.keys())
         sel = 0
         cursor = {r: 0 for r in regions}
@@ -1043,7 +1152,8 @@ def cmd_tui(_args):
         cands = load_candidates()
         for r in regions:
             cands.setdefault(r, [])
-        msg = "已加载候选列表。" if any(cands.values()) else "候选列表拉取失败，按 r 重试。"
+        msg = ("系统检查没过：" + "；".join(f"{n}：{d}" for _, n, d in _crit) + "，按 c 看完整检查。"
+               if _crit else ("已加载候选列表。" if any(cands.values()) else "候选列表拉取失败，按 r 重试。"))
         draw(stdscr, regions, sel, cursor, cands, manual, msg)
         while True:
             key = stdscr.getch()
@@ -1142,6 +1252,60 @@ def cmd_tui(_args):
                         msg = f"信誉检查失败：{e}"
                 else:
                     msg = "暂无候选，按 r 刷新后再查。"
+            elif key in (ord("c"), ord("C")):
+                # 全屏系统检查：底栏只有一行，检查结果放不下，必须全屏看。
+                stdscr.clear()
+                try:
+                    _h, _w = stdscr.getmaxyx()
+                except Exception:
+                    _h, _w = 24, 80
+                safe_add(stdscr, 0, 0, "系统检查（doctor）——按任意键返回", curses.A_BOLD)
+                _row = 2
+                for _ok, _name, _detail in system_checks():
+                    _m = '✓' if _ok else ('✗' if _name in CRITICAL_CHECKS else '○')
+                    safe_add(stdscr, _row, 0, f"{_m} {_name}：{_detail}")
+                    _row += 1
+                    if _row >= _h - 2:
+                        break
+                safe_add(stdscr, _h - 1, 0, "按任意键返回 TUI")
+                stdscr.refresh()
+                stdscr.timeout(-1)
+                stdscr.getch()
+                stdscr.timeout(500)
+                draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                continue
+            elif key in (ord("l"), ord("L")):
+                # 全屏看日志：只看选中地区最近 20 行；日志不存在就明说
+                # openvpn 还没启动过，而不是让用户去 tail 一个不存在的文件。
+                stdscr.clear()
+                try:
+                    _h, _w = stdscr.getmaxyx()
+                except Exception:
+                    _h, _w = 24, 80
+                safe_add(stdscr, 0, 0, f"{REGIONS[region]['name']} 日志（最近 20 行）——按任意键返回", curses.A_BOLD)
+                _log = region_files(region)["log"]
+                if os.path.exists(_log):
+                    try:
+                        _lines = open(_log, errors="replace").read().splitlines()[-20:]
+                    except Exception as e:
+                        _lines = [f"读日志失败：{e}"]
+                else:
+                    _lines = ["日志文件不存在：openvpn 还没真正启动过。",
+                              "先按 c 看系统检查（openvpn / tun / 配置缺哪项），",
+                              "再按 s 启动；启动失败的原因也会写进这个日志文件。"]
+                _row = 2
+                for _ln in _lines:
+                    safe_add(stdscr, _row, 0, _ln)
+                    _row += 1
+                    if _row >= _h - 2:
+                        break
+                safe_add(stdscr, _h - 1, 0, "按任意键返回 TUI")
+                stdscr.refresh()
+                stdscr.timeout(-1)
+                stdscr.getch()
+                stdscr.timeout(500)
+                draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                continue
             elif key in (ord("s"), ord("S")):
                 if pid_running(region):
                     stop_region(region)
@@ -1200,6 +1364,7 @@ def main():
             sp.add_argument("-n", type=int, default=10)
             sp.add_argument("--no-local-ping", action="store_true",
                             help="只显示 VPN Gate 公布的 Ping，不实测本地延迟")
+    sub.add_parser("doctor")
     sp = sub.add_parser("ping")
     sp.add_argument("--ip", required=True, help="要测本地延迟的出口 IP，例如 101.111.161.173")
     sp = sub.add_parser("reputation")
@@ -1224,10 +1389,12 @@ def main():
         "update": cmd_update, "list": cmd_list, "connect": cmd_connect,
         "disconnect": cmd_disconnect, "status": cmd_status,
         "watch": cmd_watch, "run": cmd_run, "set": cmd_set, "tui": cmd_tui,
-        "reputation": cmd_reputation, "ping": cmd_ping,
+        "reputation": cmd_reputation, "ping": cmd_ping, "doctor": cmd_doctor,
         "_up_hook": _up_hook, "_down_hook": _down_hook,
     }[args.action]
-    handler(args)
+    rc = handler(args)
+    if rc:
+        sys.exit(rc)
 
 
 if __name__ == "__main__":
