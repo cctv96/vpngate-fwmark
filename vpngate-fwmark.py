@@ -47,6 +47,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 
@@ -517,13 +518,24 @@ def reputation_cache_path():
         return os.path.join(d, "reputation.json")
 
 
-def fetch_json(url, headers=None, timeout=15):
+def fetch_json(url, headers=None, timeout=15, proxy=None):
+    """查 JSON 接口。proxy 优先用 VG_PROXY / 显式参数，否则走系统默认
+    （urllib 默认会读 HTTP_PROXY / HTTPS_PROXY 环境变量）。
+    在国内直连被挡（比如 proxycheck.io 打不开、返回 None）时，
+    设一个能用的 HTTP 代理就能让信誉请求走代理发出去，例如：
+    VG_PROXY=http://127.0.0.1:7890"""
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/2.0"})
+    proxy_url = proxy or os.environ.get("VG_PROXY")
+    if proxy_url:
+        opener = urllib.request.build_opener(
+            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
+        with opener.open(req, timeout=timeout) as resp:
+            return json.load(resp)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
-def check_ip_reputation(ip, force=False):
+def check_ip_reputation(ip, force=False, proxy=None):
     cache_path = reputation_cache_path()
     cache = load_json(cache_path, {})
     if not force and ip in cache:
@@ -540,7 +552,7 @@ def check_ip_reputation(ip, force=False):
               "cache_version": REPUTATION_CACHE_VERSION}
     # ip-api.com：免费，限速约 45 次/分钟，查候选时不要一次查太多。
     try:
-        d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query")
+        d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query", proxy=proxy)
         if d.get("status") == "success":
             result.update({"country": d.get("country", ""), "isp": d.get("isp", ""),
                            "org": d.get("org", ""), "asn": d.get("as", ""),
@@ -558,7 +570,7 @@ def check_ip_reputation(ip, force=False):
     try:
         best = None
         for _ in range(2):
-            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1")
+            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1", proxy=proxy)
             entry = d.get(ip) if isinstance(d, dict) else None
             if d.get("status") == "ok" and isinstance(entry, dict) and entry.get("risk") is not None:
                 if best is None or float(entry["risk"]) > float(best["risk"]):
@@ -580,7 +592,7 @@ def check_ip_reputation(ip, force=False):
         try:
             import urllib.parse
             d = fetch_json("https://check.getipintel.net/check.php?ip="
-                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json")
+                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json", proxy=proxy)
             if d.get("status") == "success":
                 score = float(d.get("result"))
                 if score >= 0:  # 负数是错误码（-5 等），不是分数
@@ -601,7 +613,7 @@ def check_ip_reputation(ip, force=False):
     if key:
         try:
             d = fetch_json(f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90",
-                           headers={"Key": key, "Accept": "application/json"})
+                           headers={"Key": key, "Accept": "application/json"}, proxy=proxy)
             result["abuse_score"] = int(d["data"]["abuseConfidenceScore"])
             result["sources"].append("AbuseIPDB")
         except Exception:
@@ -610,7 +622,7 @@ def check_ip_reputation(ip, force=False):
     key = os.environ.get("IPQS_KEY")
     if key:
         try:
-            d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}")
+            d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}", proxy=proxy)
             if d.get("success"):
                 score = float(d.get("fraud_score", 0)) / 100.0
                 if result["fraud_score"] is None or score > result["fraud_score"]:
@@ -657,7 +669,7 @@ def format_reputation(rep):
 
 
 def cmd_reputation(args):
-    rep = check_ip_reputation(args.ip, force=args.force)
+    rep = check_ip_reputation(args.ip, force=args.force, proxy=getattr(args, "proxy", None))
     print(format_reputation(rep))
     print("提醒：机房 IP 对 VPN 出口来说是正常的，单独看机房标记不能判为脏 IP；"
           "重点看欺诈分 / 滥用分是否高。")
@@ -704,6 +716,54 @@ def cmd_tui(_args):
         else:
             cursor_dict[region] = max(0, min(cursor_dict[region], len(lst) - 1))
 
+    # TUI 每行后面的欺诈分：不能一打开就同步查 20 个节点，那会卡住界面
+    # 还会被免费接口限速。所以只查当前屏幕上显示的几行，后台线程查，
+    # 查到就填上；同时最多 3 个并发，避免一下子打爆 ip-api / proxycheck。
+    # 缓存 24 小时的结果进 TUI 就直接显示，不用重新联网。
+    rep_scores = {}
+    rep_pending = set()
+    rep_lock = threading.Lock()
+    rep_sem = threading.Semaphore(3)
+    rep_proxy = os.environ.get("VG_PROXY")
+    try:
+        _cached = load_json(reputation_cache_path(), {})
+        for _ip, _e in _cached.items():
+            if (_e.get("cache_version") == REPUTATION_CACHE_VERSION
+                    and _e.get("fraud_score") is not None
+                    and time.time() - _e.get("checked_at", 0) < REPUTATION_CACHE_TTL):
+                rep_scores[_ip] = f"欺诈 {_e['fraud_score']:.2f}"
+    except Exception:
+        pass
+
+    def fraud_text(ip):
+        with rep_lock:
+            if ip in rep_scores:
+                return rep_scores[ip]
+            return "欺诈 …" if ip in rep_pending else "欺诈 未查"
+
+    def ensure_rep(ip):
+        with rep_lock:
+            if ip in rep_scores or ip in rep_pending:
+                return
+            rep_pending.add(ip)
+
+        def _work():
+            try:
+                with rep_sem:
+                    rep = check_ip_reputation(ip, proxy=rep_proxy)
+                text = (f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
+                        else "欺诈 未知")
+                with rep_lock:
+                    rep_scores[ip] = text
+            except Exception:
+                with rep_lock:
+                    rep_scores[ip] = "欺诈 未知"
+            finally:
+                with rep_lock:
+                    rep_pending.discard(ip)
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def draw(stdscr, regions, sel_region, cursor, cands, manual, msg):
         stdscr.clear()
         try:
@@ -741,7 +801,7 @@ def cmd_tui(_args):
         lst = cands.get(region, [])
         clamp_cursor(cursor, region, lst)
         safe_add(stdscr, row, 0,
-                 f"候选服务器 · {REGIONS[region]['name']}（以 IP 为主，回车手动指定，p 查信誉）",
+                 f"候选服务器 · {REGIONS[region]['name']}（欺诈分在每行后面，后台自动查，p 查详情）",
                  curses.A_BOLD)
         row += 1
         if not lst:
@@ -755,15 +815,16 @@ def cmd_tui(_args):
                 real = start + ci
                 mark = ">>" if real == cur else "  "
                 attr = curses.color_pair(2) if real == cur else 0
+                ensure_rep(s["ip"])
                 safe_add(stdscr, row, 2,
                          f"{mark} {s['ip']:<15}  {s['fqdn']:<28} "
-                         f"{s['speed_mbps']:>7} Mbps  Ping {s['ping']:>4} ms  {s['sessions']} 会话",
+                         f"{s['speed_mbps']:>7} Mbps  Ping {s['ping']:>4} ms  {s['sessions']} 会话  {fraud_text(s['ip'])}",
                          attr)
                 row += 1
         # 底栏：帮助分两行写，消息最多显示两行并截断。
         safe_add(stdscr, height - 3, 0, "─" * max(0, width - 1), curses.color_pair(5))
         safe_add(stdscr, height - 2, 0,
-                 "Tab 切换地区  ↑/↓(或j/k)选服务器  回车手动指定  a 自动  p 查信誉  r 刷新  s 启停  q 退出")
+                 "Tab 切换地区  ↑/↓(或j/k)选服务器  回车手动指定  a 自动  p 查信誉详情  r 刷新  s 启停  q 退出")
         safe_add(stdscr, height - 1, 0, str(msg)[: max(0, width - 1)])
         try:
             stdscr.refresh()
@@ -786,6 +847,10 @@ def cmd_tui(_args):
             curses.init_pair(5, curses.COLOR_CYAN, -1)                   # 分隔线
         except Exception:
             pass
+        try:
+            stdscr.timeout(500)
+        except Exception:
+            pass
         regions = list(REGIONS.keys())
         sel = 0
         cursor = {r: 0 for r in regions}
@@ -797,6 +862,10 @@ def cmd_tui(_args):
         draw(stdscr, regions, sel, cursor, cands, manual, msg)
         while True:
             key = stdscr.getch()
+            if key == -1:
+                # 500ms 超时：没有按键也重画一次，让后台查到的欺诈分及时显示。
+                draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                continue
             region = regions[sel]
             if key in (ord("q"), ord("Q")):
                 break
@@ -873,7 +942,11 @@ def cmd_tui(_args):
                     msg = f"正在查 {chosen['ip']} 的信誉……"
                     draw(stdscr, regions, sel, cursor, cands, manual, msg)
                     try:
-                        rep = check_ip_reputation(chosen["ip"])
+                        rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy)
+                        with rep_lock:
+                            rep_scores[chosen["ip"]] = (
+                                f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
+                                else "欺诈 未知")
                         msg = (f"IP {rep['ip']} 信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or ''}） "
                                f"滥用分 {rep.get('abuse_score')} 代理 {rep.get('proxy')} 机房 {rep.get('hosting')} "
                                f"ISP {rep.get('isp') or ''}")
@@ -909,6 +982,7 @@ def main():
     sp = sub.add_parser("reputation")
     sp.add_argument("--ip", required=True, help="要查的出口 IP，例如 101.111.161.173")
     sp.add_argument("--force", action="store_true", help="不用 24 小时缓存，强制重查")
+    sp.add_argument("--proxy", default=None, help="信誉请求走的 HTTP 代理，例如 http://127.0.0.1:7890；也可设 VG_PROXY 环境变量")
     sp = sub.add_parser("run")
     sp.add_argument("--region", choices=list(REGIONS.keys()), default="jp")
     sp.add_argument("command", nargs=argparse.REMAINDER)
