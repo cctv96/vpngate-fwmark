@@ -167,7 +167,11 @@ sudo vpngate-fwmark update --check-reputation
 免费源：
 
 - `ip-api.com`：国家 / ISP / 是否代理 / 是否机房 / 是否移动网络
-- `getipintel`：欺诈分 0~1，越接近 1 越可疑，无需 Key
+- `proxycheck.io`：默认欺诈分来源，风险分 0~100（程序里换算成 0~1），无需 Key
+- `getipintel`：欺诈分 0~1，仅当设置了 `VG_CONTACT_EMAIL` 为你的真实邮箱时才查。
+  注意：它不接受 `example.com` 这类占位邮箱，会返回错误码并封 IP，
+  之前欺诈分突然变 `None` 就是这个原因；没设置真实邮箱时程序会明说，
+  不再静默失败。
 
 可选付费 Key（有才查）：环境变量 `ABUSEIPDB_KEY`、`IPQS_KEY`，
 分别对应 AbuseIPDB（滥用分 0~100）和 IPQualityScore（欺诈分 0~100）。
