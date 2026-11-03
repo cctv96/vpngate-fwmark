@@ -162,6 +162,38 @@ def parse_servers(text):
     return out
 
 
+def measure_local_latency(ip, timeout=2):
+    """本地到 VPN 服务器的延迟，单位 ms，返回 (ms, 方法) 或 (None, None)。
+    注意：CSV 里的 Ping 是 VPN Gate 公布的值（它自己测的，日本服务器
+    显示 2 ms 很正常），从中国用户机器上看根本不是这个数，所以不能用它
+    当本地延迟。这里从本机实测：
+      1. 首选 ping 命令（ICMP，最标准；需要 ping 命令，见 install.sh 的
+         iputils-ping 依赖；容器里 raw socket 被禁时会失败，走第 2 步）。
+      2. 回落 TCP 握手：直连该 IP 的 443 端口计时，端口关了也会回 RST，
+         那个往返时间就是延迟；只有超时 / 被防火墙丢包才算测不到。
+         TCP 直连不走 HTTP 代理，测的是到服务器本身，不是到代理。
+    返回的方法会标出来：'ping' 或 'tcp'，让用户知道这个数是怎么来的。"""
+    try:
+        out = subprocess.run(["ping", "-c", "1", "-W", str(timeout), ip],
+                             capture_output=True, text=True, timeout=timeout + 2)
+        if "time=" in out.stdout:
+            val = out.stdout.split("time=")[-1].split()[0]
+            return float(val), "ping"
+    except Exception:
+        pass
+    try:
+        import socket
+        start = time.time()
+        try:
+            with socket.create_connection((ip, 443), timeout=timeout):
+                pass
+        except ConnectionRefusedError:
+            pass  # 端口关了但回了 RST，往返时间仍然有效
+        return round((time.time() - start) * 1000, 1), "tcp"
+    except Exception:
+        return None, None
+
+
 def candidates_by_region(servers):
     """按地区分组，每组保持速度/Ping 排序。"""
     grouped = {}
@@ -280,10 +312,32 @@ def cmd_list(args):
         print(f"\n== {info['name']} {info['code']} "
               f"(fwmark {info['mark']} / 表 {info['table']} / {info['dev']}) ==")
         # 以 IP 为主标识：主机名只是随机编号，看不出地区，IP 才是出口本身。
-        print(f"{'IP':<16} {'主机名':<28} {'速度':>10} {'Ping':>6} {'会话':>5}")
-        for s in grouped[region][: args.n]:
+        # 延迟默认就是本地实测：CSV 里的 Ping 是 VPN Gate 公布值，不是你
+        # 的机器到服务器的延迟，用它选服务器会误导，所以 list 并发实测。
+        shown = grouped[region][: args.n]
+        lat = {}
+        if not getattr(args, "no_local_ping", False):
+            from concurrent.futures import ThreadPoolExecutor
+            with ThreadPoolExecutor(max_workers=5) as ex:
+                for s, (ms, _method) in zip(shown, ex.map(
+                        lambda x: measure_local_latency(x["ip"]), shown)):
+                    lat[s["ip"]] = ms
+        print(f"{'IP':<16} {'主机名':<28} {'速度':>10} {'本地延迟':>8} {'官方Ping':>8} {'会话':>5}")
+        for s in shown:
+            ms = lat.get(s["ip"])
+            local = f"{ms:.0f} ms" if ms is not None else "-"
             print(f"{s['ip']:<16} {s['fqdn']:<28} "
-                  f"{s['speed_mbps']:>8} Mbps {s['ping']:>4} ms {s['sessions']:>5}")
+                  f"{s['speed_mbps']:>8} Mbps {local:>8} {s['ping']:>6} ms {s['sessions']:>5}")
+
+
+def cmd_ping(args):
+    ms, method = measure_local_latency(args.ip)
+    if ms is None:
+        print(f"{args.ip} 本地延迟：测不到（ping 被挡且 TCP 443 超时，"
+              f"可能是本机网络或对方防火墙丢包）")
+    else:
+        way = "ping（ICMP）" if method == "ping" else "TCP 握手（ping 被挡时的回落）"
+        print(f"{args.ip} 本地延迟：{ms:.1f} ms（{way}，从本机实测，非 VPN Gate 公布值）")
 
 
 def mark_rules(action, region):
@@ -735,6 +789,47 @@ def cmd_tui(_args):
     except Exception:
         pass
 
+    # 本地延迟：和欺诈分一样，后台测、只测当前屏幕上的行，不卡界面。
+    # 这里显示的才是“你这台机器到 VPN 服务器”的延迟，CSV 里的 Ping
+    # 是 VPN Gate 公布值，不能当本地延迟用，所以 TUI 里不再直接用它。
+    lat_scores = {}
+    lat_pending = set()
+    lat_lock = threading.Lock()
+    lat_sem = threading.Semaphore(5)
+
+    def lat_text(ip):
+        with lat_lock:
+            if ip in lat_scores:
+                return lat_scores[ip]
+            return "本地延迟 …" if ip in lat_pending else "本地延迟 未测"
+
+    def ensure_lat(ip):
+        with lat_lock:
+            if ip in lat_scores or ip in lat_pending:
+                return
+            lat_pending.add(ip)
+
+        def _work():
+            try:
+                with lat_sem:
+                    ms, method = measure_local_latency(ip)
+                if ms is None:
+                    text = "本地延迟 测不到"
+                elif method == "tcp":
+                    text = f"本地延迟 {ms:.0f} ms(TCP)"
+                else:
+                    text = f"本地延迟 {ms:.0f} ms"
+                with lat_lock:
+                    lat_scores[ip] = text
+            except Exception:
+                with lat_lock:
+                    lat_scores[ip] = "本地延迟 测不到"
+            finally:
+                with lat_lock:
+                    lat_pending.discard(ip)
+
+        threading.Thread(target=_work, daemon=True).start()
+
     def fraud_text(ip):
         with rep_lock:
             if ip in rep_scores:
@@ -816,9 +911,10 @@ def cmd_tui(_args):
                 mark = ">>" if real == cur else "  "
                 attr = curses.color_pair(2) if real == cur else 0
                 ensure_rep(s["ip"])
+                ensure_lat(s["ip"])
                 safe_add(stdscr, row, 2,
                          f"{mark} {s['ip']:<15}  {s['fqdn']:<28} "
-                         f"{s['speed_mbps']:>7} Mbps  Ping {s['ping']:>4} ms  {s['sessions']} 会话  {fraud_text(s['ip'])}",
+                         f"{s['speed_mbps']:>7} Mbps  {lat_text(s['ip'])}  {s['sessions']} 会话  {fraud_text(s['ip'])}",
                          attr)
                 row += 1
         # 底栏：帮助分两行写，消息最多显示两行并截断。
@@ -942,12 +1038,15 @@ def cmd_tui(_args):
                     msg = f"正在查 {chosen['ip']} 的信誉……"
                     draw(stdscr, regions, sel, cursor, cands, manual, msg)
                     try:
+                        _ms, _m = measure_local_latency(chosen["ip"])
+                        _local = f"{_ms:.0f} ms" if _ms is not None else "测不到"
                         rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy)
                         with rep_lock:
                             rep_scores[chosen["ip"]] = (
                                 f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
                                 else "欺诈 未知")
-                        msg = (f"IP {rep['ip']} 信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or ''}） "
+                        msg = (f"IP {rep['ip']} 本地延迟 {_local}（官方Ping {chosen.get('ping')} ms） "
+                               f"信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or ''}） "
                                f"滥用分 {rep.get('abuse_score')} 代理 {rep.get('proxy')} 机房 {rep.get('hosting')} "
                                f"ISP {rep.get('isp') or ''}")
                     except Exception as e:
@@ -979,6 +1078,10 @@ def main():
                             help="自动选时跳过信誉为高的出口（会多查几次免费接口，稍慢）")
         if name == "list":
             sp.add_argument("-n", type=int, default=10)
+            sp.add_argument("--no-local-ping", action="store_true",
+                            help="只显示 VPN Gate 公布的 Ping，不实测本地延迟")
+    sp = sub.add_parser("ping")
+    sp.add_argument("--ip", required=True, help="要测本地延迟的出口 IP，例如 101.111.161.173")
     sp = sub.add_parser("reputation")
     sp.add_argument("--ip", required=True, help="要查的出口 IP，例如 101.111.161.173")
     sp.add_argument("--force", action="store_true", help="不用 24 小时缓存，强制重查")
@@ -999,7 +1102,7 @@ def main():
         "update": cmd_update, "list": cmd_list, "connect": cmd_connect,
         "disconnect": cmd_disconnect, "status": cmd_status,
         "watch": cmd_watch, "run": cmd_run, "set": cmd_set, "tui": cmd_tui,
-        "reputation": cmd_reputation,
+        "reputation": cmd_reputation, "ping": cmd_ping,
         "_up_hook": _up_hook, "_down_hook": _down_hook,
     }[args.action]
     handler(args)
