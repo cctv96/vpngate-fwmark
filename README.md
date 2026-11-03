@@ -176,7 +176,8 @@ sudo vpngate-fwmark update --check-reputation
 可选付费 Key（有才查）：环境变量 `ABUSEIPDB_KEY`、`IPQS_KEY`，
 分别对应 AbuseIPDB（滥用分 0~100）和 IPQualityScore（欺诈分 0~100）。
 
-结果缓存 24 小时，`reputation --force` 可强制重查。
+结果缓存 24 小时，`reputation --force` 可强制重查。旧版缓存（欺诈分为 `None` 的那批）
+升级后会自动视为过期重查，不用手动清缓存。
 
 提醒：VPN Gate 本来就是机房服务器，机房标记本身不代表脏 IP，
 重点看欺诈分 / 滥用分。自动过滤只跳过“高”风险，不会因为机房
