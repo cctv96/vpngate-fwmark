@@ -109,6 +109,31 @@ class TestReputation(unittest.TestCase):
             vg.fetch_json = orig
 
 
+class TestViaTunnel(unittest.TestCase):
+    def test_via_region_passes_fwmark(self):
+        # --via jp 应该把 0x1a01 这个 fwmark 传给 fetch_json，
+        # 这样请求才走日本隧道，而不是直连或 HTTP 代理。
+        seen = {}
+        orig = vg.fetch_json
+
+        def fake(url, headers=None, timeout=15, **kw):
+            seen["mark"] = kw.get("mark")
+            if "proxycheck" in url:
+                return {"status": "ok", "1.2.3.4": {"proxy": "no", "type": "Business", "risk": 10}}
+            return {"status": "success", "country": "Japan", "isp": "Test",
+                    "org": "Test", "as": "AS123", "proxy": False,
+                    "hosting": True, "mobile": False}
+
+        vg.fetch_json = fake
+        try:
+            vg.STATE_DIR = "/tmp/vg-test-via"
+            rep = vg.check_ip_reputation("1.2.3.4", force=True, via_region="jp")
+            self.assertEqual(seen["mark"], 0x1a01)
+            self.assertEqual(rep["fraud_score"], 0.10)
+        finally:
+            vg.fetch_json = orig
+
+
 class TestLocalLatency(unittest.TestCase):
     def test_ping_output_parsed(self):
         orig_run = vg.subprocess.run
