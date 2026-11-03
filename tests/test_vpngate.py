@@ -176,6 +176,30 @@ class TestViaMihomo(unittest.TestCase):
             vg.fetch_json = orig
 
 
+class TestMihomoApi(unittest.TestCase):
+    def test_parse_api_proxies(self):
+        data = {"proxies": {
+            "JP": {"name": "JP", "type": "Selector", "now": "JP-vpn111.opengw.net",
+                  "all": ["JP-vpn111.opengw.net", "JP-vpn222.opengw.net"]},
+            "JP-vpn111.opengw.net": {"name": "JP-vpn111.opengw.net", "type": "OpenVPN",
+                                     "history": [{"time": "2026-11-04T00:00:00Z", "delay": 123}]},
+            "JP-vpn222.opengw.net": {"name": "JP-vpn222.opengw.net", "type": "OpenVPN",
+                                     "history": [{"time": "2026-11-04T00:00:00Z", "delay": 0}]},
+        }}
+        nodes, current = vg.parse_api_proxies(data, "JP")
+        self.assertEqual(current, "JP-vpn111.opengw.net")
+        self.assertEqual([n["name"] for n in nodes],
+                         ["JP-vpn111.opengw.net", "JP-vpn222.opengw.net"])
+        self.assertEqual(nodes[0]["history_delay"], 123)
+        # delay 0 = 测不到，不是 0 ms
+        self.assertIsNone(nodes[1]["history_delay"])
+
+    def test_parse_api_proxies_missing_group(self):
+        nodes, current = vg.parse_api_proxies({"proxies": {}}, "JP")
+        self.assertEqual(nodes, [])
+        self.assertIsNone(current)
+
+
 class TestLocalLatency(unittest.TestCase):
     def test_ping_output_parsed(self):
         orig_run = vg.subprocess.run
