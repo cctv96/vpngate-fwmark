@@ -1,0 +1,8 @@
+[Unit]
+Description=VPN Gate fwmark auto-update check
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vpngate-fwmark watch
