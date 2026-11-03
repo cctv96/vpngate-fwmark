@@ -572,12 +572,40 @@ def reputation_cache_path():
         return os.path.join(d, "reputation.json")
 
 
-def fetch_json(url, headers=None, timeout=15, proxy=None):
-    """查 JSON 接口。proxy 优先用 VG_PROXY / 显式参数，否则走系统默认
-    （urllib 默认会读 HTTP_PROXY / HTTPS_PROXY 环境变量）。
-    在国内直连被挡（比如 proxycheck.io 打不开、返回 None）时，
-    设一个能用的 HTTP 代理就能让信誉请求走代理发出去，例如：
-    VG_PROXY=http://127.0.0.1:7890"""
+def _marked_connect(host, port, timeout, mark):
+    """建一个打了 fwmark 的 socket：先 set SO_MARK 再 connect，
+    这样内核查路由表时就会走对应地区的表（201 日本 / 202 韩国），
+    请求就从该地区的 VPN 隧道出去，不用再搭一个 HTTP 代理。
+    SO_MARK = 36（Linux）。"""
+    import socket
+    last = None
+    for family, socktype, proto, _canon, sockaddr in socket.getaddrinfo(
+            host, port, 0, socket.SOCK_STREAM):
+        sock = socket.socket(family, socktype, proto)
+        try:
+            sock.setsockopt(socket.SOL_SOCKET, 36, mark)
+            sock.settimeout(timeout)
+            sock.connect(sockaddr)
+            return sock
+        except Exception as e:
+            last = e
+            sock.close()
+    raise last or OSError("marked connect failed")
+
+
+def fetch_json(url, headers=None, timeout=15, proxy=None, mark=None):
+    """查 JSON 接口。
+    走法按优先级：
+      1. proxy（VG_PROXY / --proxy）：走用户给的 HTTP 代理，备选。
+      2. mark（--via jp/kr 或 TUI 按地区自动给）：socket 打上该地区
+         的 fwmark，走已经连上的 VPN 隧道发出去。这是首选，不用多此一举
+         再搭 HTTP 代理——采集来的 VPN 本身就是代理。
+         注意：隧道没起来时，打了标记的流量在专用表里无路可走，
+         会失败；这时自动回落到直连一次，直连能通就用直连结果，
+         直连也被挡才算失败，不会因为隧道没起就直接报未知。
+      3. 都没有：直连（urllib 默认会读 HTTP_PROXY / HTTPS_PROXY）。
+    proxycheck / ip-api 查的是参数里的 IP，不是出口 IP，
+    所以走哪个隧道出，结果是一样的，区别只是“能不能发出去”。"""
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/2.0"})
     proxy_url = proxy or os.environ.get("VG_PROXY")
     if proxy_url:
@@ -585,11 +613,47 @@ def fetch_json(url, headers=None, timeout=15, proxy=None):
             urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
         with opener.open(req, timeout=timeout) as resp:
             return json.load(resp)
+    if mark is not None:
+        import http.client
+
+        class _MarkedHTTP(http.client.HTTPConnection):
+            def connect(self):
+                self.sock = _marked_connect(self.host, self.port or 80, self.timeout, mark)
+
+        class _MarkedHTTPS(http.client.HTTPSConnection):
+            def connect(self):
+                sock = _marked_connect(self.host, self.port or 443, self.timeout, mark)
+                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
+
+        class _HTTPHandler(urllib.request.HTTPHandler):
+            def http_open(self, req):
+                return self.do_open(_MarkedHTTP, req)
+
+        class _HTTPSHandler(urllib.request.HTTPSHandler):
+            def https_open(self, req):
+                return self.do_open(_MarkedHTTPS, req)
+
+        opener = urllib.request.build_opener(_HTTPHandler(), _HTTPSHandler())
+        try:
+            with opener.open(req, timeout=timeout) as resp:
+                return json.load(resp)
+        except Exception as marked_err:
+            # 隧道没起 / 隧道断了 / 容器里没 CAP_NET_ADMIN 打不了标记：
+            # 回落直连一次。注意不能复用同一个 Request 对象，
+            # 实测复用会在直连时 RemoteDisconnected，必须新建一个。
+            try:
+                req2 = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/2.0"})
+                with urllib.request.urlopen(req2, timeout=timeout) as resp:
+                    return json.load(resp)
+            except Exception:
+                raise marked_err
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
-def check_ip_reputation(ip, force=False, proxy=None):
+def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None):
+    if via_region in REGIONS:
+        mark = int(REGIONS[via_region]["mark"], 16)
     cache_path = reputation_cache_path()
     cache = load_json(cache_path, {})
     if not force and ip in cache:
@@ -606,7 +670,7 @@ def check_ip_reputation(ip, force=False, proxy=None):
               "cache_version": REPUTATION_CACHE_VERSION}
     # ip-api.com：免费，限速约 45 次/分钟，查候选时不要一次查太多。
     try:
-        d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query", proxy=proxy)
+        d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query", proxy=proxy, mark=mark)
         if d.get("status") == "success":
             result.update({"country": d.get("country", ""), "isp": d.get("isp", ""),
                            "org": d.get("org", ""), "asn": d.get("as", ""),
@@ -624,7 +688,7 @@ def check_ip_reputation(ip, force=False, proxy=None):
     try:
         best = None
         for _ in range(2):
-            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1", proxy=proxy)
+            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1", proxy=proxy, mark=mark)
             entry = d.get(ip) if isinstance(d, dict) else None
             if d.get("status") == "ok" and isinstance(entry, dict) and entry.get("risk") is not None:
                 if best is None or float(entry["risk"]) > float(best["risk"]):
@@ -646,7 +710,7 @@ def check_ip_reputation(ip, force=False, proxy=None):
         try:
             import urllib.parse
             d = fetch_json("https://check.getipintel.net/check.php?ip="
-                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json", proxy=proxy)
+                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json", proxy=proxy, mark=mark)
             if d.get("status") == "success":
                 score = float(d.get("result"))
                 if score >= 0:  # 负数是错误码（-5 等），不是分数
@@ -667,7 +731,7 @@ def check_ip_reputation(ip, force=False, proxy=None):
     if key:
         try:
             d = fetch_json(f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90",
-                           headers={"Key": key, "Accept": "application/json"}, proxy=proxy)
+                           headers={"Key": key, "Accept": "application/json"}, proxy=proxy, mark=mark)
             result["abuse_score"] = int(d["data"]["abuseConfidenceScore"])
             result["sources"].append("AbuseIPDB")
         except Exception:
@@ -676,7 +740,7 @@ def check_ip_reputation(ip, force=False, proxy=None):
     key = os.environ.get("IPQS_KEY")
     if key:
         try:
-            d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}", proxy=proxy)
+            d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}", proxy=proxy, mark=mark)
             if d.get("success"):
                 score = float(d.get("fraud_score", 0)) / 100.0
                 if result["fraud_score"] is None or score > result["fraud_score"]:
@@ -697,7 +761,13 @@ def check_ip_reputation(ip, force=False, proxy=None):
     else:
         risk = "未知（免费源未返回分数，仅看国家/ISP/机房标记）"
     result["risk"] = risk
-    result["checked_at"] = int(time.time())
+    # 没查到分数的“未知”结果别缓存 24 小时：隧道没起时直连被挡会
+    # 留下未知，隧道起来后 5 分钟内就应该能重查走隧道，而不是等一天。
+    # 做法是把 checked_at 往前推，只留 5 分钟有效期。
+    if fraud is None and abuse is None:
+        result["checked_at"] = int(time.time()) - REPUTATION_CACHE_TTL + 300
+    else:
+        result["checked_at"] = int(time.time())
     result["cached"] = False
     cache[ip] = result
     try:
@@ -723,7 +793,11 @@ def format_reputation(rep):
 
 
 def cmd_reputation(args):
-    rep = check_ip_reputation(args.ip, force=args.force, proxy=getattr(args, "proxy", None))
+    rep = check_ip_reputation(args.ip, force=args.force, proxy=getattr(args, "proxy", None),
+                              via_region=getattr(args, "via", None))
+    via = getattr(args, "via", None)
+    if via:
+        print(f"（信誉请求走 {REGIONS[via]['name']} 隧道发出去，隧道没起时自动回落直连）")
     print(format_reputation(rep))
     print("提醒：机房 IP 对 VPN 出口来说是正常的，单独看机房标记不能判为脏 IP；"
           "重点看欺诈分 / 滥用分是否高。")
@@ -836,7 +910,7 @@ def cmd_tui(_args):
                 return rep_scores[ip]
             return "欺诈 …" if ip in rep_pending else "欺诈 未查"
 
-    def ensure_rep(ip):
+    def ensure_rep(ip, region=None):
         with rep_lock:
             if ip in rep_scores or ip in rep_pending:
                 return
@@ -845,7 +919,10 @@ def cmd_tui(_args):
         def _work():
             try:
                 with rep_sem:
-                    rep = check_ip_reputation(ip, proxy=rep_proxy)
+                    # 该地区隧道在跑，就走该隧道发信誉请求（SO_MARK）；
+                    # 隧道没起就不打标记，直连（直连被挡时 5 分钟后可重查）。
+                    via = region if region and pid_running(region) else None
+                    rep = check_ip_reputation(ip, proxy=rep_proxy, via_region=via)
                 text = (f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
                         else "欺诈 未知")
                 with rep_lock:
@@ -910,7 +987,7 @@ def cmd_tui(_args):
                 real = start + ci
                 mark = ">>" if real == cur else "  "
                 attr = curses.color_pair(2) if real == cur else 0
-                ensure_rep(s["ip"])
+                ensure_rep(s["ip"], region)
                 ensure_lat(s["ip"])
                 safe_add(stdscr, row, 2,
                          f"{mark} {s['ip']:<15}  {s['fqdn']:<28} "
@@ -1040,7 +1117,7 @@ def cmd_tui(_args):
                     try:
                         _ms, _m = measure_local_latency(chosen["ip"])
                         _local = f"{_ms:.0f} ms" if _ms is not None else "测不到"
-                        rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy)
+                        rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy, via_region=region if pid_running(region) else None)
                         with rep_lock:
                             rep_scores[chosen["ip"]] = (
                                 f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
@@ -1059,7 +1136,10 @@ def cmd_tui(_args):
                     msg = f"{REGIONS[region]['name']}隧道已停止。"
                 elif os.path.exists(region_files(region)["ovpn"]):
                     start_region(region)
-                    msg = f"{REGIONS[region]['name']}隧道启动中。"
+                    with rep_lock:
+                        for _s in cands.get(region, []):
+                            rep_scores.pop(_s["ip"], None)
+                    msg = f"{REGIONS[region]['name']}隧道启动中，欺诈分会走隧道重查。"
                 else:
                     msg = f"{REGIONS[region]['name']}还没有配置文件，先按 r 刷新或跑 connect 生成。"
             draw(stdscr, regions, sel, cursor, cands, manual, msg)
@@ -1085,7 +1165,9 @@ def main():
     sp = sub.add_parser("reputation")
     sp.add_argument("--ip", required=True, help="要查的出口 IP，例如 101.111.161.173")
     sp.add_argument("--force", action="store_true", help="不用 24 小时缓存，强制重查")
-    sp.add_argument("--proxy", default=None, help="信誉请求走的 HTTP 代理，例如 http://127.0.0.1:7890；也可设 VG_PROXY 环境变量")
+    sp.add_argument("--proxy", default=None, help="备选：信誉请求走的 HTTP 代理，例如 http://127.0.0.1:7890；也可设 VG_PROXY 环境变量")
+    sp.add_argument("--via", choices=list(REGIONS.keys()), default=None,
+                    help="首选：信誉请求走哪个地区的 VPN 隧道发出去（jp/kr），不用再搭 HTTP 代理；隧道没起时自动回落直连")
     sp = sub.add_parser("run")
     sp.add_argument("--region", choices=list(REGIONS.keys()), default="jp")
     sp.add_argument("command", nargs=argparse.REMAINDER)
