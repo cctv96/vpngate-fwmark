@@ -500,6 +500,10 @@ def cmd_watch(args):
 # 所谓“IP 纯净度”没有统一标准，这里给的是多源综合参考，不是官方判决。
 
 REPUTATION_CACHE_TTL = 24 * 3600
+# 缓存版本号：旧版（v1）缓存里欺诈分就是 None，而且没有 fraud_source /
+# fraud_error 字段。如果升级后还信任它，用户不加 --force 就会永远看到
+# 旧的 None，哪怕新代码已经能查出分数。所以 v1 缓存一律视为过期重查。
+REPUTATION_CACHE_VERSION = 2
 
 
 def reputation_cache_path():
@@ -524,13 +528,16 @@ def check_ip_reputation(ip, force=False):
     cache = load_json(cache_path, {})
     if not force and ip in cache:
         entry = cache[ip]
-        if time.time() - entry.get("checked_at", 0) < REPUTATION_CACHE_TTL:
+        if (entry.get("cache_version") == REPUTATION_CACHE_VERSION
+                and time.time() - entry.get("checked_at", 0) < REPUTATION_CACHE_TTL):
             entry["cached"] = True
             return entry
+        # 旧版缓存：不信任，直接往下重查（不删除文件，重查后会被覆盖）。
     result = {"ip": ip, "country": "", "isp": "", "org": "", "asn": "",
               "proxy": None, "hosting": None, "mobile": None,
               "fraud_score": None, "abuse_score": None, "sources": [],
-              "fraud_source": "", "fraud_error": "", "proxy_type": ""}
+              "fraud_source": "", "fraud_error": "", "proxy_type": "",
+              "cache_version": REPUTATION_CACHE_VERSION}
     # ip-api.com：免费，限速约 45 次/分钟，查候选时不要一次查太多。
     try:
         d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query")
