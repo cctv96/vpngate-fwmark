@@ -62,16 +62,25 @@ class TestFilter(unittest.TestCase):
 class TestReputation(unittest.TestCase):
     def test_risk_low_when_fraud_low(self):
         orig = vg.fetch_json
-        vg.fetch_json = lambda url, headers=None, timeout=15: (
-            {"status": "success", "country": "Japan", "isp": "Test",
-             "org": "Test", "as": "AS123", "proxy": False,
-             "hosting": True, "mobile": False}
-            if "ip-api" in url else {"status": "success", "result": "0.12"})
+
+        def fake_fetch(url, headers=None, timeout=15):
+            if "proxycheck" in url:
+                return {"status": "ok",
+                        "101.111.161.173": {"proxy": "no", "type": "Business", "risk": 12}}
+            if "ip-api" in url:
+                return {"status": "success", "country": "Japan", "isp": "Test",
+                        "org": "Test", "as": "AS123", "proxy": False,
+                        "hosting": True, "mobile": False}
+            return {"status": "success", "result": "0.12"}
+
+        vg.fetch_json = fake_fetch
         try:
             vg.STATE_DIR = "/tmp/vg-test-state"
             rep = vg.check_ip_reputation("101.111.161.173", force=True)
             self.assertEqual(rep["risk"], "低")
             self.assertTrue(rep["hosting"])
+            self.assertEqual(rep["fraud_score"], 0.12)
+            self.assertEqual(rep["fraud_source"], "proxycheck")
         finally:
             vg.fetch_json = orig
 
