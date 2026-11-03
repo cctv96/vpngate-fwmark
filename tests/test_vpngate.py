@@ -109,5 +109,48 @@ class TestReputation(unittest.TestCase):
             vg.fetch_json = orig
 
 
+class TestLocalLatency(unittest.TestCase):
+    def test_ping_output_parsed(self):
+        orig_run = vg.subprocess.run
+
+        class FakeOut:
+            stdout = "64 bytes from 1.2.3.4: icmp_seq=1 ttl=50 time=23.4 ms\n"
+
+        vg.subprocess.run = lambda *a, **kw: FakeOut()
+        try:
+            ms, method = vg.measure_local_latency("1.2.3.4")
+            self.assertEqual(ms, 23.4)
+            self.assertEqual(method, "ping")
+        finally:
+            vg.subprocess.run = orig_run
+
+    def test_tcp_refused_still_counts_as_rtt(self):
+        # ping 命令不存在时，回落 TCP：端口关了回 RST 也算一次往返。
+        orig_run = vg.subprocess.run
+        vg.subprocess.run = lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
+        orig_conn = None
+        import socket as _socket
+        orig_conn = _socket.create_connection
+
+        class FakeSock:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_conn(addr, timeout=None):
+            raise ConnectionRefusedError()
+
+        _socket.create_connection = fake_conn
+        try:
+            ms, method = vg.measure_local_latency("1.2.3.4")
+            self.assertIsNotNone(ms)
+            self.assertEqual(method, "tcp")
+        finally:
+            vg.subprocess.run = orig_run
+            _socket.create_connection = orig_conn
+
+
 if __name__ == "__main__":
     unittest.main()
