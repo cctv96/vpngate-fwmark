@@ -611,103 +611,205 @@ def cmd_tui(_args):
         cands = load_json(CANDIDATES_FILE, {})
         if cands and any(cands.values()):
             return cands
-        grouped = candidates_by_region(parse_servers(fetch_csv()))
+        # 旧 bug：拉取失败直接抛错，TUI 一打开就崩。现在返回空列表并让界面显示“暂无候选”。
+        try:
+            grouped = candidates_by_region(parse_servers(fetch_csv()))
+        except Exception:
+            return {r: [] for r in REGIONS}
         return {r: [{k: v for k, v in s.items() if k != "config_b64"}
                      for s in grouped[r][:20]] for r in grouped}
 
+    def safe_add(stdscr, y, x, text, attr=0):
+        """旧 TUI 的最大 bug：终端一窄、消息一长，addstr 就越界崩溃。
+        这里先按屏幕宽高截断，越界直接跳过，绝不让 curses 抛错。"""
+        try:
+            height, width = stdscr.getmaxyx()
+        except Exception:
+            return
+        if y < 0 or y >= height or x < 0 or x >= width:
+            return
+        text = str(text)[: max(0, width - x - 1)]
+        if not text:
+            return
+        try:
+            stdscr.addstr(y, x, text, attr)
+        except Exception:
+            pass
+
+    def clamp_cursor(cursor_dict, region, lst):
+        if not lst:
+            cursor_dict[region] = 0
+        else:
+            cursor_dict[region] = max(0, min(cursor_dict[region], len(lst) - 1))
+
     def draw(stdscr, regions, sel_region, cursor, cands, manual, msg):
         stdscr.clear()
-        stdscr.addstr(0, 0, "vpngate-fwmark TUI  |  Tab 切换地区  上下选服务器  回车手动指定  a 自动  p 查IP信誉  r 刷新  s 启停  q 退出")
+        try:
+            height, width = stdscr.getmaxyx()
+        except Exception:
+            height, width = 24, 80
+        # 顶栏：短标题 + 状态色块，不再是一行超长中文导致小终端崩溃。
+        safe_add(stdscr, 0, 0, " vpngate-fwmark ".ljust(width), curses.color_pair(1) | curses.A_BOLD)
         row = 2
         for idx, region in enumerate(regions):
             info = REGIONS[region]
             meta = load_json(region_files(region)["meta"], {})
             mode = "手动" if region in manual else "自动"
-            running = "运行中" if pid_running(region) else "未运行"
-            head = (f"{'>' if idx == sel_region else ' '} {info['name']} {info['code']} "
-                    f"fwmark={info['mark']} 表={info['table']} {info['dev']} [{mode}] [{running}]")
-            stdscr.addstr(row, 0, head, curses.A_REVERSE if idx == sel_region else 0)
+            running = pid_running(region) is not None
+            status = "● 运行中" if running else "○ 未运行"
+            status_attr = curses.color_pair(3) if running else curses.color_pair(4)
+            arrow = "▶" if idx == sel_region else " "
+            head = (f"{arrow} {info['name']} {info['code']}  "
+                    f"fwmark {info['mark']}  表 {info['table']}  {info['dev']}  [{mode}]")
+            head_attr = curses.color_pair(2) | curses.A_BOLD if idx == sel_region else curses.A_BOLD
+            safe_add(stdscr, row, 0, head, head_attr)
+            safe_add(stdscr, row, max(0, width - 12), status, status_attr)
             row += 1
-            stdscr.addstr(row, 2, f"当前出口 IP：{meta.get('ip', '（无）')}（{meta.get('fqdn', '')}） "
-                                  f"{meta.get('speed_mbps', '')} Mbps / Ping {meta.get('ping', '')} ms")
+            safe_add(stdscr, row, 2,
+                     f"当前出口 IP：{meta.get('ip', '（无）')}（{meta.get('fqdn', '')}） "
+                     f"{meta.get('speed_mbps', '')} Mbps / Ping {meta.get('ping', '')} ms")
             row += 1
-            if idx == sel_region:
-                stdscr.addstr(row, 2, "候选服务器（以 IP 为主区分，回车设为该地区的手动出口，p 查选中 IP 的信誉）：")
+            # 地区卡片之间的分隔线，让两个地区一眼分开。
+            safe_add(stdscr, row, 0, "─" * max(0, width - 1), curses.color_pair(5))
+            row += 1
+        # 候选列表：按剩余高度算能显示几行，带滚动，绝不写出屏幕底部。
+        footer_rows = 3
+        avail = max(1, height - row - footer_rows - 1)
+        region = regions[sel_region]
+        lst = cands.get(region, [])
+        clamp_cursor(cursor, region, lst)
+        safe_add(stdscr, row, 0,
+                 f"候选服务器 · {REGIONS[region]['name']}（以 IP 为主，回车手动指定，p 查信誉）",
+                 curses.A_BOLD)
+        row += 1
+        if not lst:
+            safe_add(stdscr, row, 2, "暂无候选，按 r 刷新列表。")
+        else:
+            cur = cursor[region]
+            start = 0
+            if cur >= start + avail:
+                start = cur - avail + 1
+            for ci, s in enumerate(lst[start:start + avail]):
+                real = start + ci
+                mark = ">>" if real == cur else "  "
+                attr = curses.color_pair(2) if real == cur else 0
+                safe_add(stdscr, row, 2,
+                         f"{mark} {s['ip']:<15}  {s['fqdn']:<28} "
+                         f"{s['speed_mbps']:>7} Mbps  Ping {s['ping']:>4} ms  {s['sessions']} 会话",
+                         attr)
                 row += 1
-                for ci, s in enumerate(cands.get(region, [])[:8]):
-                    mark = ">>" if ci == cursor[region] else "  "
-                    stdscr.addstr(row, 4, f"{mark} IP {s['ip']}  {s['fqdn']} "
-                                          f"{s['speed_mbps']} Mbps / Ping {s['ping']} ms / {s['sessions']} 会话")
-                    row += 1
-            row += 1
-        stdscr.addstr(row + 1, 0, "运行命令：run --region jp -- <命令> 走日本；run --region kr -- <命令> 走韩国")
-        stdscr.addstr(row + 2, 0, msg[:180])
-        stdscr.refresh()
+        # 底栏：帮助分两行写，消息最多显示两行并截断。
+        safe_add(stdscr, height - 3, 0, "─" * max(0, width - 1), curses.color_pair(5))
+        safe_add(stdscr, height - 2, 0,
+                 "Tab 切换地区  ↑/↓(或j/k)选服务器  回车手动指定  a 自动  p 查信誉  r 刷新  s 启停  q 退出")
+        safe_add(stdscr, height - 1, 0, str(msg)[: max(0, width - 1)])
+        try:
+            stdscr.refresh()
+        except Exception:
+            pass
 
     def main_tui(stdscr):
-        curses.curs_set(0)
+        try:
+            curses.curs_set(0)
+        except Exception:
+            pass
+        # 颜色：单色终端会失败，失败就退回无色，界面照样能用。
+        try:
+            curses.start_color()
+            curses.use_default_colors()
+            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)   # 顶栏
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)   # 选中行
+            curses.init_pair(3, curses.COLOR_GREEN, -1)                  # 运行中
+            curses.init_pair(4, curses.COLOR_RED, -1)                    # 未运行
+            curses.init_pair(5, curses.COLOR_CYAN, -1)                   # 分隔线
+        except Exception:
+            pass
         regions = list(REGIONS.keys())
         sel = 0
         cursor = {r: 0 for r in regions}
         manual = load_json(MANUAL_FILE, {})
         cands = load_candidates()
-        msg = "已加载候选列表。"
+        for r in regions:
+            cands.setdefault(r, [])
+        msg = "已加载候选列表。" if any(cands.values()) else "候选列表拉取失败，按 r 重试。"
         draw(stdscr, regions, sel, cursor, cands, manual, msg)
         while True:
             key = stdscr.getch()
             region = regions[sel]
             if key in (ord("q"), ord("Q")):
                 break
+            elif key == curses.KEY_RESIZE:
+                pass  # 下一轮 draw 会按新尺寸重画，不再因旧尺寸越界
             elif key == 9:  # Tab
                 sel = (sel + 1) % len(regions)
-            elif key == curses.KEY_UP:
+            elif key in (curses.KEY_UP, ord("k")):
                 cursor[region] = max(0, cursor[region] - 1)
-            elif key == curses.KEY_DOWN:
+            elif key in (curses.KEY_DOWN, ord("j")):
                 lst = cands.get(region, [])
                 cursor[region] = min(max(0, len(lst) - 1), cursor[region] + 1)
             elif key in (curses.KEY_ENTER, 10, 13):
                 lst = cands.get(region, [])
+                clamp_cursor(cursor, region, lst)
                 if lst:
                     chosen = lst[cursor[region]]
                     manual[region] = chosen["fqdn"]
                     with open(MANUAL_FILE, "w") as f:
                         json.dump(manual, f, ensure_ascii=False, indent=2)
-                    # 手动切换：需要完整配置数据，重新拉取一次
-                    grouped = candidates_by_region(parse_servers(fetch_csv()))
-                    srv, _ = choose_for_region(region, grouped, manual)
+                    # 手动切换：需要完整配置数据，重新拉取一次。
+                    # 旧 bug：服务器不在列表时也先停了隧道，导致手动换服失败还断网。
+                    # 现在是先确认新服务器存在才停旧隧道。
+                    try:
+                        grouped = candidates_by_region(parse_servers(fetch_csv()))
+                        srv, _ = choose_for_region(region, grouped, manual)
+                    except Exception as e:
+                        srv = None
+                        msg = f"拉取列表失败，未切换：{e}"
                     if srv:
                         save_region(region, srv, "manual")
                         stop_region(region)
                         time.sleep(2)
                         start_region(region)
-                        msg = f"{REGIONS[region]['name']}已手动切换到 {srv['fqdn']}。"
-                    else:
-                        msg = "该服务器已不在列表，切换失败。"
+                        msg = f"{REGIONS[region]['name']}已手动切换到 {srv['ip']}（{srv['fqdn']}）。"
+                    elif "拉取列表失败" not in msg:
+                        msg = "该服务器已不在列表，切换失败，旧隧道未动。"
+                else:
+                    msg = "暂无候选，按 r 刷新后再选。"
             elif key in (ord("a"), ord("A")):
                 manual.pop(region, None)
                 with open(MANUAL_FILE, "w") as f:
                     json.dump(manual, f, ensure_ascii=False, indent=2)
-                grouped = candidates_by_region(parse_servers(fetch_csv()))
-                srv, _ = choose_for_region(region, grouped, manual)
+                try:
+                    grouped = candidates_by_region(parse_servers(fetch_csv()))
+                    srv, _ = choose_for_region(region, grouped, manual)
+                except Exception as e:
+                    srv = None
+                    msg = f"拉取列表失败，未切换：{e}"
                 if srv:
                     save_region(region, srv, "auto")
                     stop_region(region)
                     time.sleep(2)
                     start_region(region)
-                    msg = f"{REGIONS[region]['name']}已恢复自动：{srv['fqdn']}。"
+                    msg = f"{REGIONS[region]['name']}已恢复自动：{srv['ip']}（{srv['fqdn']}）。"
+                elif "拉取列表失败" not in msg:
+                    msg = "暂无候选，恢复自动失败。"
             elif key in (ord("r"), ord("R")):
-                cands = load_candidates()
                 try:
                     grouped = candidates_by_region(parse_servers(fetch_csv()))
                     cands = {r: [{k: v for k, v in s.items() if k != "config_b64"}
                                  for s in grouped[r][:20]] for r in grouped}
+                    for r in regions:
+                        cands.setdefault(r, [])
+                        clamp_cursor(cursor, r, cands[r])
                     msg = "列表已刷新。"
                 except Exception as e:
                     msg = f"刷新失败：{e}"
             elif key in (ord("p"), ord("P")):
                 lst = cands.get(region, [])
+                clamp_cursor(cursor, region, lst)
                 if lst:
                     chosen = lst[cursor[region]]
+                    msg = f"正在查 {chosen['ip']} 的信誉……"
+                    draw(stdscr, regions, sel, cursor, cands, manual, msg)
                     try:
                         rep = check_ip_reputation(chosen["ip"])
                         msg = (f"IP {rep['ip']} 信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')} "
@@ -715,13 +817,17 @@ def cmd_tui(_args):
                                f"ISP {rep.get('isp') or ''}")
                     except Exception as e:
                         msg = f"信誉检查失败：{e}"
+                else:
+                    msg = "暂无候选，按 r 刷新后再查。"
             elif key in (ord("s"), ord("S")):
                 if pid_running(region):
                     stop_region(region)
                     msg = f"{REGIONS[region]['name']}隧道已停止。"
-                else:
+                elif os.path.exists(region_files(region)["ovpn"]):
                     start_region(region)
                     msg = f"{REGIONS[region]['name']}隧道启动中。"
+                else:
+                    msg = f"{REGIONS[region]['name']}还没有配置文件，先按 r 刷新或跑 connect 生成。"
             draw(stdscr, regions, sel, cursor, cands, manual, msg)
 
     curses.wrapper(main_tui)
