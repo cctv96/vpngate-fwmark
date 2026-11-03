@@ -84,6 +84,30 @@ class TestReputation(unittest.TestCase):
         finally:
             vg.fetch_json = orig
 
+    def test_old_cache_without_version_is_rechecked(self):
+        # 模拟升级前的旧缓存：欺诈分 None、无 cache_version，不加 --force
+        # 也必须重查，不能把旧的 None 原样返回。
+        import json as _json, os as _os, time as _time
+        orig = vg.fetch_json
+        vg.fetch_json = lambda url, headers=None, timeout=15: (
+            {"status": "ok", "101.111.161.173": {"proxy": "no", "type": "Business", "risk": 12}}
+            if "proxycheck" in url else
+            {"status": "success", "country": "Japan", "isp": "Test",
+             "org": "Test", "as": "AS123", "proxy": False,
+             "hosting": True, "mobile": False})
+        try:
+            vg.STATE_DIR = "/tmp/vg-test-state-oldcache"
+            _os.makedirs(vg.STATE_DIR, exist_ok=True)
+            with open(_os.path.join(vg.STATE_DIR, "reputation.json"), "w") as f:
+                _json.dump({"101.111.161.173": {
+                    "ip": "101.111.161.173", "fraud_score": None,
+                    "sources": ["ip-api.com"], "checked_at": int(_time.time())}}, f)
+            rep = vg.check_ip_reputation("101.111.161.173")
+            self.assertEqual(rep["fraud_score"], 0.12)
+            self.assertFalse(rep.get("cached"))
+        finally:
+            vg.fetch_json = orig
+
 
 if __name__ == "__main__":
     unittest.main()
