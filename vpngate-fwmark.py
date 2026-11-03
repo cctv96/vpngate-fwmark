@@ -405,12 +405,24 @@ def ensure_user(region):
 
 
 def start_region(region):
+    """启动一个地区的隧道。返回 True/False，让调用方能明说失败原因，
+    而不是静默地“按了 s 但状态还是未运行”。
+    False 的常见原因：openvpn 没装、ovpn 配置文件不存在。"""
+    import shutil
+    if shutil.which("openvpn") is None:
+        return False
     ensure_user(region)
     files = region_files(region)
     if pid_running(region):
-        return
-    subprocess.Popen(["openvpn", "--daemon", "--config", files["ovpn"],
-                      "--writepid", files["pid"], "--log", files["log"]])
+        return True
+    if not os.path.exists(files["ovpn"]):
+        return False
+    try:
+        subprocess.Popen(["openvpn", "--daemon", "--config", files["ovpn"],
+                          "--writepid", files["pid"], "--log", files["log"]])
+    except Exception:
+        return False
+    return True
 
 
 def stop_region(region):
@@ -1134,14 +1146,42 @@ def cmd_tui(_args):
                 if pid_running(region):
                     stop_region(region)
                     msg = f"{REGIONS[region]['name']}隧道已停止。"
-                elif os.path.exists(region_files(region)["ovpn"]):
-                    start_region(region)
-                    with rep_lock:
-                        for _s in cands.get(region, []):
-                            rep_scores.pop(_s["ip"], None)
-                    msg = f"{REGIONS[region]['name']}隧道启动中，欺诈分会走隧道重查。"
                 else:
-                    msg = f"{REGIONS[region]['name']}还没有配置文件，先按 r 刷新或跑 connect 生成。"
+                    # 旧 bug：这里只在 ovpn 存在时才启动，不存在就让用户
+                    # “按 r 刷新”，但 r 只刷新内存里的候选列表，根本不生成
+                    # ovpn，所以按多少次 r 再按 s 还是连不上，死循环。
+                    # 现在 s 没配置就直接拉取一次、生成配置再启动。
+                    if not os.path.exists(region_files(region)["ovpn"]):
+                        msg = f"{REGIONS[region]['name']}还没有配置文件，正在拉取生成……"
+                        draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                        try:
+                            grouped = candidates_by_region(parse_servers(fetch_csv()))
+                            srv, _ = choose_for_region(region, grouped, manual)
+                            if srv:
+                                save_region(region, srv, "manual" if region in manual else "auto")
+                                cands[region] = [{k: v for k, v in s.items() if k != "config_b64"}
+                                                 for s in grouped[region][:20]]
+                                msg = f"{REGIONS[region]['name']}配置已生成（{srv['ip']}），正在启动隧道……"
+                            else:
+                                msg = f"{REGIONS[region]['name']}拉取列表为空，启动失败。"
+                                draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                                continue
+                        except Exception as e:
+                            msg = f"{REGIONS[region]['name']}拉取配置失败：{e}，先在外面跑 sudo vpngate-fwmark connect 看日志。"
+                            draw(stdscr, regions, sel, cursor, cands, manual, msg)
+                            continue
+                    import shutil as _shutil
+                    if _shutil.which("openvpn") is None:
+                        msg = f"{REGIONS[region]['name']}启动失败：本机没有 openvpn，先跑安装脚本装依赖。"
+                    elif start_region(region):
+                        with rep_lock:
+                            for _s in cands.get(region, []):
+                                rep_scores.pop(_s["ip"], None)
+                        msg = (f"{REGIONS[region]['name']}隧道启动中，稍等几秒看状态；"
+                               f"若一直未运行，退出 TUI 看 /var/lib/vpngate-fwmark/{region}.log 末尾。")
+                    else:
+                        msg = (f"{REGIONS[region]['name']}启动失败：openvpn 没起来，"
+                               f"退出 TUI 看 /var/lib/vpngate-fwmark/{region}.log 末尾（一般是服务器下线/认证/无 tun 设备）。")
             draw(stdscr, regions, sel, cursor, cands, manual, msg)
 
     curses.wrapper(main_tui)
