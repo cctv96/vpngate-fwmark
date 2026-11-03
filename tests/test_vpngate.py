@@ -63,7 +63,7 @@ class TestReputation(unittest.TestCase):
     def test_risk_low_when_fraud_low(self):
         orig = vg.fetch_json
 
-        def fake_fetch(url, headers=None, timeout=15):
+        def fake_fetch(url, headers=None, timeout=15, **kw):
             if "proxycheck" in url:
                 return {"status": "ok",
                         "101.111.161.173": {"proxy": "no", "type": "Business", "risk": 12}}
@@ -89,7 +89,7 @@ class TestReputation(unittest.TestCase):
         # 也必须重查，不能把旧的 None 原样返回。
         import json as _json, os as _os, time as _time
         orig = vg.fetch_json
-        vg.fetch_json = lambda url, headers=None, timeout=15: (
+        vg.fetch_json = lambda url, headers=None, timeout=15, **kw: (
             {"status": "ok", "101.111.161.173": {"proxy": "no", "type": "Business", "risk": 12}}
             if "proxycheck" in url else
             {"status": "success", "country": "Japan", "isp": "Test",
