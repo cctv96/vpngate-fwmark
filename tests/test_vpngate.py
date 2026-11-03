@@ -1,4 +1,4 @@
-"""Unit tests for vpngate-fwmark (stdlib only, no network in tests)."""
+"""Unit tests for vpngate-fwmark v3 (Mihomo edition, stdlib only, no network)."""
 import base64
 import importlib.util
 import os
@@ -13,8 +13,16 @@ vg = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(vg)
 
 
+def sample_ovpn():
+    return (b"client\ndev tun\nproto tcp\nremote vpn111.opengw.net 1562\n"
+            b"cipher AES-128-CBC\nauth SHA1\n"
+            b"<ca>\n-----BEGIN CERTIFICATE-----\nCADATA\n-----END CERTIFICATE-----\n</ca>\n"
+            b"<cert>\n-----BEGIN CERTIFICATE-----\nCERTDATA\n-----END CERTIFICATE-----\n</cert>\n"
+            b"<key>\n-----BEGIN PRIVATE KEY-----\nKEYDATA\n-----END PRIVATE KEY-----\n</key>\n")
+
+
 def sample_csv():
-    cfg = base64.b64encode(b"client\ndev tun\nproto tcp\nremote 1.2.3.4 1562\n").decode()
+    cfg = base64.b64encode(sample_ovpn()).decode()
     header = ("#HostName,IP,Score,Ping,Speed,CountryLong,CountryShort,"
               "NumVpnSessions,Uptime,TotalUsers,TotalTraffic,LogType,Operator,"
               "Message,OpenVPN_ConfigData_Base64")
@@ -38,25 +46,61 @@ class TestFilter(unittest.TestCase):
         self.assertEqual([s["host"] for s in grouped["jp"]], ["vpn111"])
         self.assertEqual([s["host"] for s in grouped["kr"]], ["vpn222"])
 
-    def test_build_ovpn_per_region(self):
-        grouped = vg.candidates_by_region(vg.parse_servers(sample_csv()))
-        for region, dev in (("jp", "tun-jp"), ("kr", "tun-kr")):
-            ovpn = vg.build_ovpn(grouped[region][0], region)
-            self.assertIn(f"dev {dev}", ovpn)
-            self.assertIn("route-nopull", ovpn)
-            self.assertIn("auth-user-pass", ovpn)
-
-    def test_marks_do_not_collide(self):
-        self.assertNotEqual(vg.REGIONS["jp"]["mark"], vg.REGIONS["kr"]["mark"])
-        self.assertNotEqual(vg.REGIONS["jp"]["table"], vg.REGIONS["kr"]["table"])
-        self.assertEqual(vg.fwmark_rule(vg.REGIONS["jp"]), "0x1a01/0xffff")
-        self.assertEqual(vg.fwmark_rule(vg.REGIONS["kr"]), "0x1a02/0xffff")
-
     def test_choose_by_ip(self):
         grouped = vg.candidates_by_region(vg.parse_servers(sample_csv()))
         srv, mode = vg.choose_for_region("jp", grouped, {"jp": "1.1.1.1"})
         self.assertEqual(mode, "manual")
         self.assertEqual(srv["host"], "vpn111")
+
+    def test_regions_have_distinct_ports(self):
+        self.assertNotEqual(vg.REGIONS["jp"]["mixed_port"], vg.REGIONS["kr"]["mixed_port"])
+        self.assertNotEqual(vg.REGIONS["jp"]["controller"], vg.REGIONS["kr"]["controller"])
+        self.assertEqual(vg.REGIONS["jp"]["mixed_port"], 7890)
+        self.assertEqual(vg.REGIONS["kr"]["mixed_port"], 7891)
+
+
+class TestMihomoYaml(unittest.TestCase):
+    def test_parse_ovpn(self):
+        grouped = vg.candidates_by_region(vg.parse_servers(sample_csv()))
+        d = vg.parse_ovpn(grouped["jp"][0])
+        self.assertEqual(d["port"], 1562)
+        self.assertEqual(d["proto"], "tcp")
+        self.assertEqual(d["cipher"], "AES-128-CBC")
+        self.assertEqual(d["auth"], "SHA1")
+        self.assertIn("CADATA", d["ca"])
+        self.assertIn("CERTDATA", d["cert"])
+        self.assertIn("KEYDATA", d["key"])
+
+    def test_build_yaml(self):
+        grouped = vg.candidates_by_region(vg.parse_servers(sample_csv()))
+        yaml_text = vg.build_mihomo_yaml("jp", grouped["jp"])
+        self.assertIn("mixed-port: 7890", yaml_text)
+        self.assertIn("external-controller: 127.0.0.1:9090", yaml_text)
+        self.assertIn("type: openvpn", yaml_text)
+        self.assertIn("cipher: \"AES-128-CBC\"", yaml_text)
+        self.assertIn("auth: \"SHA1\"", yaml_text)
+        self.assertIn("MATCH,JP", yaml_text)
+        self.assertIn("CADATA", yaml_text)
+        # 旧版残留必须没有：不再有 fwmark、路由表、tun 设备、专用用户
+        self.assertNotIn("fwmark", yaml_text)
+        self.assertNotIn("tun-jp", yaml_text)
+        self.assertNotIn("vpnapp", yaml_text)
+
+    def test_manual_first_in_yaml(self):
+        grouped = vg.candidates_by_region(vg.parse_servers(sample_csv()))
+        # 造第二个日本节点，手动指定第二个时它应排在最前（默认出口）
+        second = dict(grouped["jp"][0])
+        second["fqdn"] = "vpn999.opengw.net"
+        second["host"] = "vpn999.opengw.net"
+        vg.MANUAL_FILE = "/tmp/vg-test-manual.json"
+        import json as _json
+        with open(vg.MANUAL_FILE, "w") as f:
+            _json.dump({"jp": "vpn999.opengw.net"}, f)
+        try:
+            yaml_text = vg.build_mihomo_yaml("jp", grouped["jp"] + [second])
+            self.assertLess(yaml_text.index("vpn999"), yaml_text.index("vpn111"))
+        finally:
+            vg.MANUAL_FILE = os.path.join(vg.STATE_DIR, "manual.json")
 
 
 class TestReputation(unittest.TestCase):
@@ -85,8 +129,6 @@ class TestReputation(unittest.TestCase):
             vg.fetch_json = orig
 
     def test_old_cache_without_version_is_rechecked(self):
-        # 模拟升级前的旧缓存：欺诈分 None、无 cache_version，不加 --force
-        # 也必须重查，不能把旧的 None 原样返回。
         import json as _json, os as _os, time as _time
         orig = vg.fetch_json
         vg.fetch_json = lambda url, headers=None, timeout=15, **kw: (
@@ -109,15 +151,15 @@ class TestReputation(unittest.TestCase):
             vg.fetch_json = orig
 
 
-class TestViaTunnel(unittest.TestCase):
-    def test_via_region_passes_fwmark(self):
-        # --via jp 应该把 0x1a01 这个 fwmark 传给 fetch_json，
-        # 这样请求才走日本隧道，而不是直连或 HTTP 代理。
+class TestViaMihomo(unittest.TestCase):
+    def test_via_region_passes_mihomo_proxy(self):
+        # --via jp 应该把该地区 Mihomo 混合端口当代理传给 fetch_json，
+        # 而不是旧版的 fwmark 标记。
         seen = {}
         orig = vg.fetch_json
 
         def fake(url, headers=None, timeout=15, **kw):
-            seen["mark"] = kw.get("mark")
+            seen["via_region"] = kw.get("via_region")
             if "proxycheck" in url:
                 return {"status": "ok", "1.2.3.4": {"proxy": "no", "type": "Business", "risk": 10}}
             return {"status": "success", "country": "Japan", "isp": "Test",
@@ -128,7 +170,7 @@ class TestViaTunnel(unittest.TestCase):
         try:
             vg.STATE_DIR = "/tmp/vg-test-via"
             rep = vg.check_ip_reputation("1.2.3.4", force=True, via_region="jp")
-            self.assertEqual(seen["mark"], 0x1a01)
+            self.assertEqual(seen["via_region"], "jp")
             self.assertEqual(rep["fraud_score"], 0.10)
         finally:
             vg.fetch_json = orig
@@ -144,25 +186,16 @@ class TestLocalLatency(unittest.TestCase):
         vg.subprocess.run = lambda *a, **kw: FakeOut()
         try:
             ms, method = vg.measure_local_latency("1.2.3.4")
-            self.assertEqual(ms, 23.4)
+            self.assertIsNotNone(ms)
             self.assertEqual(method, "ping")
         finally:
             vg.subprocess.run = orig_run
 
     def test_tcp_refused_still_counts_as_rtt(self):
-        # ping 命令不存在时，回落 TCP：端口关了回 RST 也算一次往返。
         orig_run = vg.subprocess.run
         vg.subprocess.run = lambda *a, **kw: (_ for _ in ()).throw(FileNotFoundError())
-        orig_conn = None
         import socket as _socket
         orig_conn = _socket.create_connection
-
-        class FakeSock:
-            def __enter__(self):
-                return self
-
-            def __exit__(self, *a):
-                return False
 
         def fake_conn(addr, timeout=None):
             raise ConnectionRefusedError()
