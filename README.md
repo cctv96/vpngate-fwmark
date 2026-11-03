@@ -100,17 +100,29 @@ TCP 443 握手计时并标 `ms(TCP)`；测不到显示 `测不到`。`list` 也�
 sudo vpngate-fwmark ping --ip 101.111.161.173
 ```
 
-如果直连打不开信誉接口（在国内常见），让信誉请求走代理：
+如果直连打不开信誉接口（在国内常见），不用再搭 HTTP 代理——
+直接走已经采集来的 VPN 隧道发请求，隧道本身就是代理：
 
 ```bash
-VG_PROXY=http://127.0.0.1:7890 sudo -E vpngate-fwmark tui
-VG_PROXY=http://127.0.0.1:7890 sudo -E vpngate-fwmark reputation --ip 101.111.161.173 --force
-# 或者命令行直接指定：
-sudo vpngate-fwmark reputation --ip 101.111.161.173 --force --proxy http://127.0.0.1:7890
+# TUI 里自动按地区走隧道：日本节点走 tun-jp，韩国节点走 tun-kr，
+# 隧道没起时自动回落直连，隧道启动后“未知”会在 5 分钟内重查。
+sudo vpngate-fwmark tui
+
+# 命令行单独查，走指定地区隧道：
+sudo vpngate-fwmark reputation --ip 101.111.161.173 --via jp
+sudo vpngate-fwmark reputation --ip 182.225.221.34 --via kr
 ```
 
-注意：`sudo` 默认会清环境变量，所以用 `sudo -E` 才能把 `VG_PROXY` 传进去；
-`--proxy` 参数不用 `-E`，更省事。代理只是用来发信誉请求，不是 VPN 隧道本身。
+原理：信誉请求的 socket 打上该地区的 fwmark（日本 0x1a01 / 韩国 0x1a02），
+内核就会按路由表走对应隧道；查的是参数里的 IP，不是出口 IP，
+所以走哪个隧道出，结果是一样的，区别只是“能不能发出去”。
+
+HTTP 代理只是备选（比如隧道也没起、直连也被挡时）：
+
+```bash
+sudo vpngate-fwmark reputation --ip 101.111.161.173 --force --proxy http://127.0.0.1:7890
+# 或 VG_PROXY=http://127.0.0.1:7890 sudo -E vpngate-fwmark tui（sudo 要加 -E 才能传环境变量）
+```
 
 不用进 TUI 也能手动指定：
 
