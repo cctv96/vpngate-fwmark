@@ -49,15 +49,15 @@ fi
 # 安装依赖：Debian/Ubuntu 用 apt，其它发行版用 dnf/yum/pacman。
 if command -v apt-get >/dev/null 2>&1; then
   apt-get update
-  apt-get install -y openvpn iptables iproute2 python3 curl
+  apt-get install -y openvpn iptables iproute2 python3 curl iputils-ping
 elif command -v dnf >/dev/null 2>&1; then
-  dnf install -y openvpn iptables iproute2 python3 curl
+  dnf install -y openvpn iptables iproute2 python3 curl iputils
 elif command -v yum >/dev/null 2>&1; then
-  yum install -y openvpn iptables iproute2 python3 curl
+  yum install -y openvpn iptables iproute2 python3 curl iputils
 elif command -v pacman >/dev/null 2>&1; then
-  pacman -Sy --noconfirm openvpn iptables iproute2 python curl
+  pacman -Sy --noconfirm openvpn iptables iproute2 python curl iputils
 else
-  echo "未识别的包管理器，请先手动安装 openvpn、iptables、iproute2、python3、curl。" >&2
+  echo "未识别的包管理器，请先手动安装 openvpn、iptables、iproute2、python3、curl、ping（iputils-ping）。" >&2
   exit 1
 fi
 
