@@ -485,11 +485,18 @@ def cmd_watch(args):
 # 说明：ipleak.net 这类网站是“泄漏测试”网页，没有公开 API，不适合程序调用。
 # 这里用的是可程序调用的免费源，外加两个可选的付费 Key（有 Key 才查）：
 #   免费：ip-api.com（国家/ISP/是否代理/是否机房/是否移动网络）
-#         getipintel（欺诈分 0~1，越接近 1 越可疑，无需 Key）
+#         proxycheck.io（风险分 0~100，无需 Key，只用 vpn=1&risk=1 这一组参数）
+#         getipintel（欺诈分 0~1，仅当设置了 VG_CONTACT_EMAIL 时才查）
 #   可选：AbuseIPDB（环境变量 ABUSEIPDB_KEY，滥用分 0~100）
 #         IPQualityScore（环境变量 IPQS_KEY，欺诈分 0~100）
-# 注意：VPN Gate 本来就是志愿者机房服务器，hosting=True 很常见，
-# 单独因为“机房”就判高风险是错的；高风险只看欺诈分 / 滥用分 / 代理标记。
+# 2026-11-04 实测到的故障：getipintel 对 example.com 这类占位邮箱返回
+# status=error、result=-5（“IP 被封 / 邮箱无效”），旧代码把这个错误悄悄
+# 吞掉，欺诈分就显示 None，用户完全不知道为什么。现在修复为：
+#   1. 不再用 example.com 当 contact；没设置真实邮箱就不调 getipintel，
+#      并在结果里明说原因，不再静默失败。
+#   2. 默认欺诈分改走 proxycheck.io，它无需 Key 就能返回 risk 分。
+#   3. 代理 / 机房标记不再单独决定风险：VPN 出口本来就是代理/机房，
+#      只看欺诈分 / 滥用分 / proxycheck 风险分。
 # 所谓“IP 纯净度”没有统一标准，这里给的是多源综合参考，不是官方判决。
 
 REPUTATION_CACHE_TTL = 24 * 3600
@@ -522,7 +529,8 @@ def check_ip_reputation(ip, force=False):
             return entry
     result = {"ip": ip, "country": "", "isp": "", "org": "", "asn": "",
               "proxy": None, "hosting": None, "mobile": None,
-              "fraud_score": None, "abuse_score": None, "sources": []}
+              "fraud_score": None, "abuse_score": None, "sources": [],
+              "fraud_source": "", "fraud_error": "", "proxy_type": ""}
     # ip-api.com：免费，限速约 45 次/分钟，查候选时不要一次查太多。
     try:
         d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query")
@@ -534,14 +542,53 @@ def check_ip_reputation(ip, force=False):
             result["sources"].append("ip-api.com")
     except Exception:
         pass
-    # getipintel：欺诈分，免费但要求 contact 参数（填一个占位邮箱即可）。
+    # proxycheck.io：默认欺诈分来源，无需 Key。用且只用 vpn=1&risk=1，
+    # 多加 asn/port/seen 等参数时实测会返回不一致的结果，所以不加。
+    # 另外实测发现：同一 IP 连查几次，免费端点有时返回 risk 66（Shadowsocks），
+    # 有时返回 risk 0（Business），疑似后端负载均衡不一致。安全起见查两次取最高分，
+    # 宁可把可疑的往高了算，也不让一次偶然的 0 把风险洗白。结果缓存 24 小时，
+    # 不会每次都翻倍消耗免费额度。
     try:
-        d = fetch_json(f"https://check.getipintel.net/check.php?ip={ip}&contact=vpngate-fwmark@example.com&format=json")
-        if d.get("status") == "success":
-            result["fraud_score"] = float(d.get("result"))
-            result["sources"].append("getipintel")
-    except Exception:
-        pass
+        best = None
+        for _ in range(2):
+            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1")
+            entry = d.get(ip) if isinstance(d, dict) else None
+            if d.get("status") == "ok" and isinstance(entry, dict) and entry.get("risk") is not None:
+                if best is None or float(entry["risk"]) > float(best["risk"]):
+                    best = entry
+        if best is not None:
+            result["fraud_score"] = float(best["risk"]) / 100.0
+            result["fraud_source"] = "proxycheck"
+            result["proxy_type"] = best.get("type", "")
+            if result["proxy"] is None:
+                result["proxy"] = best.get("proxy") == "yes"
+            result["sources"].append("proxycheck")
+    except Exception as e:
+        result["fraud_error"] = f"proxycheck 失败：{e}"
+    # getipintel：仅当用户设置了真实联系邮箱时才查。
+    # 占位邮箱（example.com）会被它判定为无效并封 IP，返回 error/-5，
+    # 这就是之前欺诈分突然变 None 的直接原因。
+    contact = os.environ.get("VG_CONTACT_EMAIL", "").strip()
+    if contact and "@" in contact and not contact.endswith("@example.com"):
+        try:
+            import urllib.parse
+            d = fetch_json("https://check.getipintel.net/check.php?ip="
+                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json")
+            if d.get("status") == "success":
+                score = float(d.get("result"))
+                if score >= 0:  # 负数是错误码（-5 等），不是分数
+                    if result["fraud_score"] is None or score > result["fraud_score"]:
+                        result["fraud_score"] = score
+                    result["fraud_source"] = (result["fraud_source"] + "+getipintel").strip("+")
+                    result["sources"].append("getipintel")
+                else:
+                    result["fraud_error"] = f"getipintel 返回错误码 {d.get('result')}：{d.get('message', '')}"
+            else:
+                result["fraud_error"] = f"getipintel 返回 {d.get('status')}：{d.get('message', '')}"
+        except Exception as e:
+            result["fraud_error"] = f"getipintel 失败：{e}"
+    elif not result["fraud_error"]:
+        result["fraud_error"] = "getipintel 未调用：请设置 VG_CONTACT_EMAIL 为你的真实邮箱（它要求真实联系邮箱）"
     # 可选：AbuseIPDB
     key = os.environ.get("ABUSEIPDB_KEY")
     if key:
@@ -552,21 +599,25 @@ def check_ip_reputation(ip, force=False):
             result["sources"].append("AbuseIPDB")
         except Exception:
             pass
-    # 可选：IPQualityScore
+    # 可选：IPQualityScore（取多源中的最高分，不静默覆盖）
     key = os.environ.get("IPQS_KEY")
     if key:
         try:
             d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}")
             if d.get("success"):
-                result["fraud_score"] = float(d.get("fraud_score", 0)) / 100.0
+                score = float(d.get("fraud_score", 0)) / 100.0
+                if result["fraud_score"] is None or score > result["fraud_score"]:
+                    result["fraud_score"] = score
+                result["fraud_source"] = (result["fraud_source"] + "+IPQS").strip("+")
                 result["sources"].append("IPQualityScore")
         except Exception:
             pass
     fraud = result["fraud_score"]
     abuse = result["abuse_score"]
+    # 代理/机房不再单独定风险：VPN 出口本来就是代理/机房，只看分数。
     if (abuse is not None and abuse >= 75) or (fraud is not None and fraud >= 0.9):
         risk = "高"
-    elif (abuse is not None and abuse >= 50) or (fraud is not None and fraud >= 0.7) or result["proxy"] is True:
+    elif (abuse is not None and abuse >= 50) or (fraud is not None and fraud >= 0.7):
         risk = "中"
     elif fraud is not None or abuse is not None:
         risk = "低"
@@ -587,11 +638,15 @@ def check_ip_reputation(ip, force=False):
 def format_reputation(rep):
     def yn(v):
         return "是" if v is True else ("否" if v is False else "未知")
-    return (f"IP {rep['ip']} 信誉：{rep['risk']} | 国家 {rep.get('country') or '-'} | "
+    text = (f"IP {rep['ip']} 信誉：{rep['risk']} | 国家 {rep.get('country') or '-'} | "
             f"ISP {rep.get('isp') or rep.get('org') or '-'} | ASN {rep.get('asn') or '-'} | "
             f"代理 {yn(rep.get('proxy'))} | 机房 {yn(rep.get('hosting'))} | "
-            f"欺诈分 {rep.get('fraud_score')} | 滥用分 {rep.get('abuse_score')} | "
+            f"欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or '无'}）| "
+            f"滥用分 {rep.get('abuse_score')} | "
             f"来源 {','.join(rep.get('sources') or ['无'])}")
+    if rep.get("fraud_score") is None and rep.get("fraud_error"):
+        text += f" | 说明：{rep['fraud_error']}"
+    return text
 
 
 def cmd_reputation(args):
@@ -812,7 +867,7 @@ def cmd_tui(_args):
                     draw(stdscr, regions, sel, cursor, cands, manual, msg)
                     try:
                         rep = check_ip_reputation(chosen["ip"])
-                        msg = (f"IP {rep['ip']} 信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')} "
+                        msg = (f"IP {rep['ip']} 信誉 {rep['risk']} 欺诈分 {rep.get('fraud_score')}（{rep.get('fraud_source') or ''}） "
                                f"滥用分 {rep.get('abuse_score')} 代理 {rep.get('proxy')} 机房 {rep.get('hosting')} "
                                f"ISP {rep.get('isp') or ''}")
                     except Exception as e:
