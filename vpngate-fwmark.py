@@ -1,42 +1,46 @@
 #!/usr/bin/env python3
 """
-vpngate-fwmark v2: 双地区、双 fwmark、双隧道 + TUI
+vpngate-fwmark v3: Mihomo 版
 
-两个地区，两个完全独立的出口：
-  日本 JP: fwmark 0x1a01, 路由表 201, 隧道 tun-jp, 运行用户 vpnapp-jp
-  韩国 KR: fwmark 0x1a02, 路由表 202, 隧道 tun-kr, 运行用户 vpnapp-kr
+直接替换旧版的 fwmark / OpenVPN 实现，不再自己做路由标记：
+旧版要自己维护 fwmark、路由表、iptables、专用用户、tun 隧道，
+任何一环没起来就表现为“按了 s 但没连上、连日志都没有”。
+新版把拨号和切换交给 Mihomo（Clash Meta）：
 
-  为什么不用 1、2：1、2 太常用，Docker、其它 VPN、系统服务都可能
-  占用，撞上就会互相抢流量。0x1a01 / 0x1a02 是特意挑的不常用值，
-  且 ip rule 带 /0xffff 全掩码，只精确匹配这两个标记，不会误伤
-  别人打的标记。旧版的 1 / 101、2 / 102 规则在 connect / disconnect
-  时会自动清理一次。
+  日本 JP: Mihomo 实例 1，混合端口 7890，控制端口 9090，代理组 JP
+  韩国 KR: Mihomo 实例 2，混合端口 7891，控制端口 9091，代理组 KR
 
-  以 vpnapp-jp 运行的程序 -> 标记 1 -> 表 101 -> 日本隧道
-  以 vpnapp-kr 运行的程序 -> 标记 2 -> 表 102 -> 韩国隧道
-  其它程序 -> 主路由表，不受影响
-  OpenVPN 本身以 root 运行、不带标记 -> 走主路由表，不环路
+  两个实例可以同时跑，互不干扰；切换节点是调 Mihomo 的控制 API，
+  不用重启隧道、不用重新拨号，TUI 里回车就切。
 
-自动选择：
-  update / connect / watch 默认给每个地区选速度最高、Ping 最低的
-  vpn* 服务器（排除 public-vpn-*），每 6 小时过期重选。
+抓取和筛选不变：
+  VPN Gate 公开 API，主机名只留 vpn*（排除 public-vpn-*），
+  只留日本、韩国，自动选速度最高、Ping 最低的服务器。
 
-手动指定（TUI）：
-  sudo vpngate-fwmark tui
-  Tab 切换地区，上下选候选服务器，回车设为该地区的手动出口，
-  按 a 恢复该地区自动选择，按 r 重新拉取列表，按 q 退出（隧道保持运行）。
+为什么 Mihomo 能直接拨 VPN Gate：
+  Mihomo v1.19.25 起自带 type: openvpn 出站，支持 VPN Gate 配置里的
+  cipher AES-128-CBC、auth SHA1、ca / cert / key 内联证书、用户名密码
+  vpn / vpn，且 VPN Gate 配置里没有 tls-auth / tls-crypt 这种
+  容易卡住的字段。程序把 .ovpn 解析成 Mihomo 的 proxies，不是
+  再去调 openvpn 二进制。
 
-命令行手动指定也可以，不用进 TUI：
-  sudo vpngate-fwmark set --region jp --server vpn341881580.opengw.net
-  sudo vpngate-fwmark set --region kr --auto
+指定程序怎么走 VPN（和旧版的区别，一定要看）：
+  旧版是包级别分流：任何程序（支不支持代理都行）都能走指定出口。
+  新版是代理级别分流：程序要走代理才行。
+    sudo vpngate-fwmark run --region jp -- curl -s ifconfig.me
+  run 会给这条命令设好代理环境变量（http/https 走 7890，socks 走
+  7890），curl、wget、git、python requests 这类认环境变量的程序
+  直接就能用。浏览器要在设置里手动填代理 127.0.0.1:7890，
+  或者用支持代理的启动参数；不认代理的程序目前走不了，这是
+  换 Mihomo 换来的代价，不是 bug。
 
-其它用法（需 root）：
+用法（需 root，状态在 /var/lib/vpngate-fwmark）：
   vpngate-fwmark update / list / connect / disconnect / status
   vpngate-fwmark run --region jp -- curl -s ifconfig.me
-  vpngate-fwmark run --region kr -- firefox
+  vpngate-fwmark set --region jp --server vpn341881580.opengw.net
+  vpngate-fwmark set --region jp --auto
+  vpngate-fwmark tui
   vpngate-fwmark watch   # systemd timer 每 6 小时调用
-
-账号：VPN Gate 公开账号 vpn / vpn。配置用 route-nopull，不改全局路由。
 """
 
 import argparse
@@ -45,47 +49,29 @@ import csv
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
 import time
 import urllib.request
+import urllib.error
 
 API_URL = "http://www.vpngate.net/api/iphone/"
 STATE_DIR = os.environ.get("VG_STATE_DIR", "/var/lib/vpngate-fwmark")
 CONFIG_DIR = os.environ.get("VG_CONFIG_DIR", "/etc/vpngate-fwmark")
-AUTH_FILE = os.path.join(STATE_DIR, "auth.txt")
+MIHOMO_BIN = os.environ.get("VG_MIHOMO_BIN", "/usr/local/bin/mihomo")
+MIHOMO_VERSION = "v1.19.33"
 CANDIDATES_FILE = os.path.join(STATE_DIR, "candidates.json")
 MANUAL_FILE = os.path.join(STATE_DIR, "manual.json")
 MAX_AGE = 6 * 3600
 
-# 地区 -> fwmark / 路由表 / 隧道名 / 运行用户
-# fwmark 用不常用的 0x1a01 / 0x1a02，路由表用 201 / 202，避开 1、2、100 这种常用值。
+# 地区 -> 国家码 / 混合端口 / 控制端口 / 代理组名
+# 两个实例各占一对端口，同时跑也不冲突。
 REGIONS = {
-    "jp": {"name": "日本", "code": "JP", "mark": "0x1a01", "table": 201,
-           "dev": "tun-jp", "user": "vpnapp-jp"},
-    "kr": {"name": "韩国", "code": "KR", "mark": "0x1a02", "table": 202,
-           "dev": "tun-kr", "user": "vpnapp-kr"},
+    "jp": {"name": "日本", "code": "JP", "mixed_port": 7890, "controller": 9090, "group": "JP"},
+    "kr": {"name": "韩国", "code": "KR", "mixed_port": 7891, "controller": 9091, "group": "KR"},
 }
-# 旧版用过的标记 / 路由表，升级时清理掉，避免新旧规则并存。
-LEGACY_MARKS = [(1, 101), (2, 102)]
-
-
-def fwmark_rule(info):
-    """ip rule 用的带全掩码的标记，只精确匹配本应用的标记。"""
-    return f"{info['mark']}/0xffff"
-
-
-def cleanup_legacy():
-    for mark, table in LEGACY_MARKS:
-        for user in ("vpnapp-jp", "vpnapp-kr", "vpnapp"):
-            run(["iptables", "-t", "mangle", "-D", "OUTPUT",
-                 "-m", "owner", "--uid-owner", user,
-                 "-j", "MARK", "--set-mark", str(mark)])
-        run(["ip", "rule", "del", "fwmark", str(mark), "table", str(table)],
-            check=False)
-        run(["ip", "route", "flush", "table", str(table)], check=False)
-DEV_TO_REGION = {v["dev"]: k for k, v in REGIONS.items()}
 
 
 def run(cmd, check=False):
@@ -104,7 +90,7 @@ def ensure_dirs():
 
 def region_files(region):
     return {
-        "ovpn": os.path.join(STATE_DIR, f"{region}.ovpn"),
+        "yaml": os.path.join(STATE_DIR, f"{region}.yaml"),
         "meta": os.path.join(STATE_DIR, f"{region}.json"),
         "pid": os.path.join(STATE_DIR, f"{region}.pid"),
         "log": os.path.join(STATE_DIR, f"{region}.log"),
@@ -119,7 +105,7 @@ def load_json(path, default):
 
 
 def fetch_csv(url=API_URL, timeout=30):
-    req = urllib.request.Request(url, headers={"User-Agent": "vpngate-fwmark/2.0"})
+    req = urllib.request.Request(url, headers={"User-Agent": "vpngate-fwmark/3.0"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return resp.read().decode("utf-8", errors="replace")
 
@@ -162,100 +148,11 @@ def parse_servers(text):
     return out
 
 
-def measure_local_latency(ip, timeout=2):
-    """本地到 VPN 服务器的延迟，单位 ms，返回 (ms, 方法) 或 (None, None)。
-    注意：CSV 里的 Ping 是 VPN Gate 公布的值（它自己测的，日本服务器
-    显示 2 ms 很正常），从中国用户机器上看根本不是这个数，所以不能用它
-    当本地延迟。这里从本机实测：
-      1. 首选 ping 命令（ICMP，最标准；需要 ping 命令，见 install.sh 的
-         iputils-ping 依赖；容器里 raw socket 被禁时会失败，走第 2 步）。
-      2. 回落 TCP 握手：直连该 IP 的 443 端口计时，端口关了也会回 RST，
-         那个往返时间就是延迟；只有超时 / 被防火墙丢包才算测不到。
-         TCP 直连不走 HTTP 代理，测的是到服务器本身，不是到代理。
-    返回的方法会标出来：'ping' 或 'tcp'，让用户知道这个数是怎么来的。"""
-    try:
-        out = subprocess.run(["ping", "-c", "1", "-W", str(timeout), ip],
-                             capture_output=True, text=True, timeout=timeout + 2)
-        if "time=" in out.stdout:
-            val = out.stdout.split("time=")[-1].split()[0]
-            return float(val), "ping"
-    except Exception:
-        pass
-    try:
-        import socket
-        start = time.time()
-        try:
-            with socket.create_connection((ip, 443), timeout=timeout):
-                pass
-        except ConnectionRefusedError:
-            pass  # 端口关了但回了 RST，往返时间仍然有效
-        return round((time.time() - start) * 1000, 1), "tcp"
-    except Exception:
-        return None, None
-
-
 def candidates_by_region(servers):
-    """按地区分组，每组保持速度/Ping 排序。"""
     grouped = {}
     for region, info in REGIONS.items():
         grouped[region] = [s for s in servers if s["country"] == info["code"]]
     return grouped
-
-
-def build_ovpn(server, region, use_ddns=True):
-    """解码官方配置，改成该地区的分流专用配置。"""
-    info = REGIONS[region]
-    raw = base64.b64decode(server["config_b64"]).decode("utf-8", errors="replace")
-    lines, seen_remote, seen_auth, seen_dev = [], False, False, False
-    for ln in raw.splitlines():
-        stripped = ln.strip()
-        if stripped.startswith("remote "):
-            if seen_remote:
-                continue
-            parts = stripped.split()
-            port = parts[2] if len(parts) > 2 else "1195"
-            target = server["fqdn"] if use_ddns else server["ip"]
-            lines.append(f"remote {target} {port}")
-            seen_remote = True
-        elif stripped.startswith("auth-user-pass"):
-            lines.append(f"auth-user-pass {AUTH_FILE}")
-            seen_auth = True
-        elif stripped.startswith("dev "):
-            lines.append(f"dev {info['dev']}")
-            seen_dev = True
-        elif stripped.startswith(("route ", "redirect-gateway", "dhcp-option")):
-            continue
-        else:
-            lines.append(ln)
-    if not seen_dev:
-        lines.append(f"dev {info['dev']}")
-    if not seen_remote:
-        lines.append(f"remote {server['fqdn']} 1195")
-    if not seen_auth:
-        lines.append(f"auth-user-pass {AUTH_FILE}")
-    lines += [
-        "route-nopull", "script-security 2",
-        f"up {os.path.abspath(__file__)} _up_hook",
-        f"down {os.path.abspath(__file__)} _down_hook",
-        "persist-tun",
-    ]
-    return "\n".join(lines) + "\n"
-
-
-def save_region(region, server, mode, use_ddns=True):
-    ensure_dirs()
-    files = region_files(region)
-    with open(AUTH_FILE, "w") as f:
-        f.write("vpn\nvpn\n")
-    os.chmod(AUTH_FILE, 0o600)
-    with open(files["ovpn"], "w") as f:
-        f.write(build_ovpn(server, region, use_ddns=use_ddns))
-    meta = {k: v for k, v in server.items() if k != "config_b64"}
-    meta["updated_at"] = int(time.time())
-    meta["mode"] = mode
-    with open(files["meta"], "w") as f:
-        json.dump(meta, f, ensure_ascii=False, indent=2)
-    return meta
 
 
 def choose_for_region(region, grouped, manual):
@@ -271,8 +168,146 @@ def choose_for_region(region, grouped, manual):
     return cands[0], "auto"
 
 
-def cmd_update(args):
-    need_root()
+def proxy_name(server):
+    """Mihomo 里的节点名：地区前缀 + 主机名，一眼看出是哪个出口。"""
+    return f"{server['country']}-{server['fqdn']}"
+
+
+def parse_ovpn(server):
+    """把 VPN Gate 的 .ovpn 文本解析成 Mihomo openvpn 出站需要的字段。
+    只取第一个 remote（VPN Gate 配置里一般就一个），proto 里含 tcp
+    就是 tcp，否则按 udp 处理；ca / cert / key 从内联块里取。"""
+    raw = base64.b64decode(server["config_b64"]).decode("utf-8", errors="replace")
+
+    def block(name):
+        m = re.search(rf"<{name}>(.*?)</{name}>", raw, re.S)
+        return m.group(1).strip() if m else ""
+
+    def kv(key):
+        m = re.search(rf"^{key}\s+(.+)$", raw, re.M)
+        return m.group(1).strip() if m else ""
+
+    remote = kv("remote").split()
+    proto_raw = kv("proto") or "tcp"
+    proto = "tcp" if "tcp" in proto_raw else "udp"
+    return {
+        "server": server["fqdn"],
+        "port": int(remote[1]) if len(remote) > 1 and remote[1].isdigit() else 1194,
+        "proto": proto,
+        "cipher": kv("cipher"),
+        "auth": kv("auth"),
+        "ca": block("ca"),
+        "cert": block("cert"),
+        "key": block("key"),
+    }
+
+
+def _indent_block(text, spaces):
+    pad = " " * spaces
+    return "\n".join(pad + ln for ln in text.splitlines())
+
+
+def build_mihomo_yaml(region, servers, use_ip=False):
+    """给一个地区生成 Mihomo 配置。
+    servers 是该地区的全部候选（按速度排好），全部放进 proxies，
+    这样 TUI / set 切任何一个都不用重新生成配置，API 一调就切。
+    代理组只有一个 select 组，MATCH 全指到它：混合端口进来的流量
+    全部走这个组，组里当前选中的节点就是出口。"""
+    info = REGIONS[region]
+    # 手动指定的放最前面：Mihomo select 组默认选第一个，
+    # 这样实例刚启动、还没来得及调 API 时，默认出口也是手动那个。
+    manual = load_json(MANUAL_FILE, {})
+    wanted = manual.get(region)
+    ordered = list(servers)
+    if wanted:
+        ordered.sort(key=lambda s: 0 if (s["fqdn"] == wanted or s["host"] == wanted
+                                          or s["ip"] == wanted) else 1)
+    lines = [
+        f"mixed-port: {info['mixed_port']}",
+        "allow-lan: false",
+        "mode: rule",
+        "log-level: info",
+        "ipv6: false",
+        f"external-controller: 127.0.0.1:{info['controller']}",
+        "dns:",
+        "  enable: true",
+        # 国内 8.8.8.8 / 1.1.1.1 常被挡或很慢，Mihomo 解析 VPN Gate
+        # 主机名（opengw.net）时一旦 DNS 全失败，隧道连握手都开始不了。
+        # 加 223.5.5.5（阿里）和 114.114.114.114（114DNS）兜底，
+        # 解析的只是公开域名，不是敏感查询。
+        "  nameserver:",
+        "    - 8.8.8.8",
+        "    - 1.1.1.1",
+        "    - 223.5.5.5",
+        "    - 114.114.114.114",
+        "proxies:",
+    ]
+    names = []
+    for s in ordered:
+        d = parse_ovpn(s)
+        name = proxy_name(s)
+        names.append(name)
+        if use_ip:
+            d["server"] = s["ip"]
+        lines.append(f"  - name: {json.dumps(name)}")
+        lines.append("    type: openvpn")
+        lines.append(f"    server: {json.dumps(d['server'])}")
+        lines.append(f"    port: {d['port']}")
+        lines.append(f"    proto: {d['proto']}")
+        lines.append('    username: "vpn"')
+        lines.append('    password: "vpn"')
+        if d["cipher"]:
+            lines.append(f"    cipher: {json.dumps(d['cipher'])}")
+        if d["auth"]:
+            lines.append(f"    auth: {json.dumps(d['auth'])}")
+        lines.append(f"    udp: {'false' if d['proto'] == 'tcp' else 'true'}")
+        if d["ca"]:
+            lines.append("    ca: |")
+            lines.append(_indent_block(d["ca"], 6))
+        if d["cert"]:
+            lines.append("    cert: |")
+            lines.append(_indent_block(d["cert"], 6))
+        if d["key"]:
+            lines.append("    key: |")
+            lines.append(_indent_block(d["key"], 6))
+    lines.append("proxy-groups:")
+    lines.append(f"  - name: {json.dumps(info['group'])}")
+    lines.append("    type: select")
+    lines.append("    proxies:")
+    for n in names:
+        lines.append(f"      - {json.dumps(n)}")
+    lines.append("rules:")
+    lines.append(f"  - MATCH,{info['group']}")
+    return "\n".join(lines) + "\n"
+
+
+def save_region(region, servers, mode, use_ip=False):
+    """写 Mihomo 配置 + 元数据，返回选中的服务器元数据。"""
+    ensure_dirs()
+    files = region_files(region)
+    manual = load_json(MANUAL_FILE, {})
+    grouped = {region: servers}
+    chosen, _mode = choose_for_region(region, grouped, manual)
+    mode = _mode if chosen else mode
+    with open(files["yaml"], "w") as f:
+        f.write(build_mihomo_yaml(region, servers, use_ip=use_ip))
+    meta = {}
+    if chosen:
+        meta = {k: v for k, v in chosen.items() if k != "config_b64"}
+    meta["updated_at"] = int(time.time())
+    meta["mode"] = mode
+    meta["mixed_port"] = REGIONS[region]["mixed_port"]
+    meta["controller"] = REGIONS[region]["controller"]
+    meta["group"] = REGIONS[region]["group"]
+    with open(files["meta"], "w") as f:
+        json.dump(meta, f, ensure_ascii=False, indent=2)
+    return meta
+
+
+def update_all(args):
+    """拉取 + 生成两个地区的 Mihomo 配置。已在跑的实例会重启一次
+    让新配置生效（Mihomo 不会自动重读配置文件）；没跑的只写配置，
+    不自动拉起来。返回 grouped（完整候选）。"""
     servers = parse_servers(fetch_csv())
     grouped = candidates_by_region(servers)
     if not any(grouped.values()):
@@ -288,8 +323,6 @@ def cmd_update(args):
         if not chosen:
             print(f"{REGIONS[region]['name']}：暂无候选，跳过。")
             continue
-        # 可选：自动选时跳过信誉为“高”的出口，最多往后试 5 台。
-        # 手动指定的不跳过（用户自己选的，程序不替用户否决），只提示。
         if check_rep and mode == "auto":
             for cand in grouped[region][:5]:
                 rep = check_ip_reputation(cand["ip"])
@@ -298,11 +331,47 @@ def cmd_update(args):
                     continue
                 chosen = cand
                 break
-        meta = save_region(region, chosen, mode, use_ddns=not getattr(args, "use_ip", False))
+        was_running = pid_running(region) is not None
+        meta = save_region(region, grouped[region], mode,
+                           use_ip=getattr(args, "use_ip", False))
+        if was_running:
+            stop_region(region)
+            time.sleep(1)
+            start_region(region)
         print(f"{meta['country']} 已更新（{mode}）：{meta['fqdn']} "
               f"{meta['speed_mbps']} Mbps / Ping {meta['ping']} ms / "
               f"{meta['sessions']} 会话。")
     return grouped
+
+
+def cmd_update(args):
+    need_root()
+    update_all(args)
+
+
+def measure_local_latency(ip, timeout=2):
+    """本地到 VPN 服务器的延迟，单位 ms，返回 (ms, 方法) 或 (None, None)。
+    CSV 里的 Ping 是 VPN Gate 公布值，不是本机到服务器的延迟，不能直接用。
+    先 ping（ICMP），被挡就回落 TCP 443 握手计时（端口关了回 RST 也算往返）。"""
+    try:
+        out = subprocess.run(["ping", "-c", "1", "-W", str(timeout), ip],
+                             capture_output=True, text=True, timeout=timeout + 2)
+        if "time=" in out.stdout:
+            val = out.stdout.split("time=")[-1].split()[0]
+            return float(val), "ping"
+    except Exception:
+        pass
+    try:
+        import socket
+        start = time.time()
+        try:
+            with socket.create_connection((ip, 443), timeout=timeout):
+                pass
+        except ConnectionRefusedError:
+            pass
+        return round((time.time() - start) * 1000, 1), "tcp"
+    except Exception:
+        return None, None
 
 
 def cmd_list(args):
@@ -310,10 +379,7 @@ def cmd_list(args):
     grouped = candidates_by_region(parse_servers(fetch_csv()))
     for region, info in REGIONS.items():
         print(f"\n== {info['name']} {info['code']} "
-              f"(fwmark {info['mark']} / 表 {info['table']} / {info['dev']}) ==")
-        # 以 IP 为主标识：主机名只是随机编号，看不出地区，IP 才是出口本身。
-        # 延迟默认就是本地实测：CSV 里的 Ping 是 VPN Gate 公布值，不是你
-        # 的机器到服务器的延迟，用它选服务器会误导，所以 list 并发实测。
+              f"(混合端口 {info['mixed_port']} / 控制端口 {info['controller']} / 组 {info['group']}) ==")
         shown = grouped[region][: args.n]
         lat = {}
         if not getattr(args, "no_local_ping", False):
@@ -333,56 +399,57 @@ def cmd_list(args):
 def cmd_ping(args):
     ms, method = measure_local_latency(args.ip)
     if ms is None:
-        print(f"{args.ip} 本地延迟：测不到（ping 被挡且 TCP 443 超时，"
-              f"可能是本机网络或对方防火墙丢包）")
+        print(f"{args.ip} 本地延迟：测不到（ping 被挡且 TCP 443 超时）")
     else:
         way = "ping（ICMP）" if method == "ping" else "TCP 握手（ping 被挡时的回落）"
         print(f"{args.ip} 本地延迟：{ms:.1f} ms（{way}，从本机实测，非 VPN Gate 公布值）")
 
 
-def mark_rules(action, region):
-    info = REGIONS[region]
-    flag = "-A" if action == "add" else "-D"
-    run(["iptables", "-t", "mangle", flag, "OUTPUT",
-         "-m", "owner", "--uid-owner", info["user"],
-         "-j", "MARK", "--set-mark", str(info["mark"])])
+# ---------------- Mihomo 控制 API ----------------
+
+def controller_base(region):
+    return f"http://127.0.0.1:{REGIONS[region]['controller']}"
 
 
-def _apply_up(dev, gateway):
-    region = DEV_TO_REGION.get(dev)
-    if not region:
-        return 1
-    info = REGIONS[region]
-    run(["ip", "rule", "del", "fwmark", fwmark_rule(info),
-         "table", str(info["table"])], check=False)
-    run(["ip", "rule", "add", "fwmark", fwmark_rule(info),
-         "table", str(info["table"]), "priority", "100"], check=False)
-    run(["ip", "route", "flush", "table", str(info["table"])], check=False)
-    if gateway:
-        run(["ip", "route", "add", "default", "via", gateway,
-             "dev", dev, "table", str(info["table"])], check=False)
-    mark_rules("add", region)
-    return 0
+def api_get(region, path, timeout=5):
+    try:
+        req = urllib.request.Request(controller_base(region) + path)
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return json.load(resp)
+    except Exception:
+        return None
 
 
-def _up_hook(_args):
-    dev = os.environ.get("dev", "")
-    gateway = (os.environ.get("ifconfig_remote")
-               or os.environ.get("route_vpn_gateway") or "")
-    return _apply_up(dev, gateway)
+def api_switch(region, proxy_name_value, timeout=10):
+    """切代理组当前节点：PUT /proxies/<组名> {"name": "<节点名>"}。
+    返回 True/False，失败不抛错，让调用方决定是提示还是走更新重启。"""
+    try:
+        data = json.dumps({"name": proxy_name_value}).encode()
+        req = urllib.request.Request(
+            controller_base(region) + "/proxies/" + REGIONS[region]["group"],
+            data=data, method="PUT",
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status in (200, 204)
+    except Exception:
+        return False
 
 
-def _down_hook(_args):
-    dev = os.environ.get("dev", "")
-    region = DEV_TO_REGION.get(dev)
-    if not region:
-        return 1
-    info = REGIONS[region]
-    mark_rules("delete", region)
-    run(["ip", "rule", "del", "fwmark", fwmark_rule(info),
-         "table", str(info["table"])], check=False)
-    run(["ip", "route", "flush", "table", str(info["table"])], check=False)
-    return 0
+def api_current(region):
+    data = api_get(region, "/proxies")
+    if not data:
+        return None
+    group = data.get("proxies", {}).get(REGIONS[region]["group"], {})
+    return group.get("now")
+
+
+def wait_controller(region, timeout=15):
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        if api_get(region, "/proxies", timeout=2):
+            return True
+        time.sleep(0.5)
+    return False
 
 
 def pid_running(region):
@@ -397,19 +464,9 @@ def pid_running(region):
     return None
 
 
-def ensure_user(region):
-    user = REGIONS[region]["user"]
-    if run(["id", user]).returncode != 0:
-        run(["useradd", "--system", "--no-create-home",
-             "--shell", "/usr/sbin/nologin", user], check=False)
-
-
 def start_region(region):
-    """启动一个地区的隧道。返回 True/False，让调用方能明说失败原因，
-    而不是静默地“按了 s 但状态还是未运行”。
-    预检失败时把原因写进日志文件本身：以前 openvpn 没装 / 没配置时，
-    openvpn 根本没被拉起来，日志文件就不存在，用户去 tail 只能看到
-    “文件不存在”，完全不知道为什么。现在至少日志里有原因。"""
+    """启动一个地区的 Mihomo 实例。返回 True/False，预检失败把原因
+    写进该地区日志文件本身（旧版教训：日志不存在时用户完全不知道为什么）。"""
     import shutil
     files = region_files(region)
     os.makedirs(STATE_DIR, exist_ok=True)
@@ -422,20 +479,31 @@ def start_region(region):
             pass
         return False
 
-    if shutil.which("openvpn") is None:
-        return _fail("本机没有 openvpn，请跑安装脚本装依赖")
-    if not os.path.exists("/dev/net/tun"):
-        return _fail("没有 /dev/net/tun，内核/容器没给 tun 设备，隧道起不来")
+    if shutil.which(MIHOMO_BIN) is None and not os.path.exists(MIHOMO_BIN):
+        return _fail(f"本机没有 mihomo（{MIHOMO_BIN}），请跑安装脚本")
     if pid_running(region):
         return True
-    if not os.path.exists(files["ovpn"]):
-        return _fail(f"配置文件不存在：{files['ovpn']}，先跑 connect 生成")
-    ensure_user(region)
+    if not os.path.exists(files["yaml"]):
+        return _fail(f"配置文件不存在：{files['yaml']}，先跑 connect 生成")
     try:
-        subprocess.Popen(["openvpn", "--daemon", "--config", files["ovpn"],
-                          "--writepid", files["pid"], "--log", files["log"]])
+        logf = open(files["log"], "a")
+        proc = subprocess.Popen([MIHOMO_BIN, "-f", files["yaml"]],
+                                stdout=logf, stderr=logf,
+                                start_new_session=True, cwd=STATE_DIR)
+        with open(files["pid"], "w") as f:
+            f.write(str(proc.pid))
     except Exception as e:
-        return _fail(f"拉起 openvpn 失败：{e}")
+        return _fail(f"拉起 mihomo 失败：{e}")
+    if not wait_controller(region):
+        return _fail("mihomo 启动后控制端口一直没响应，看日志末尾找原因")
+    # 启动后按手动指定再切一次：配置文件里手动节点虽然排在最前，
+    # 但 API 切一次最保险，避免 Mihomo 默认选了别的节点。
+    manual = load_json(MANUAL_FILE, {})
+    if manual.get(region):
+        meta = load_json(files["meta"], {})
+        if meta.get("fqdn"):
+            # 节点名 = 地区-主机名，和 build_mihomo_yaml 里一致
+            api_switch(region, f"{REGIONS[region]['code']}-{meta['fqdn']}")
     return True
 
 
@@ -444,36 +512,34 @@ def stop_region(region):
     if pid:
         try:
             os.kill(pid, 15)
+            for _ in range(10):
+                time.sleep(0.2)
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
         except ProcessLookupError:
             pass
-    _down_hook_for_region(region)
-
-
-def _down_hook_for_region(region):
-    info = REGIONS[region]
-    mark_rules("delete", region)
-    run(["ip", "rule", "del", "fwmark", fwmark_rule(info),
-         "table", str(info["table"])], check=False)
-    run(["ip", "route", "flush", "table", str(info["table"])], check=False)
+    try:
+        os.remove(region_files(region)["pid"])
+    except Exception:
+        pass
 
 
 def cmd_connect(args):
     need_root()
     ensure_dirs()
-    # 启动前先系统检查：openvpn / tun 缺了，隧道根本起不来，
-    # 与其假装“启动中”再让用户去找一个不存在的日志，不如直接说缺什么。
     _critical = [c for c in system_checks()
-                 if c[1] in ("openvpn", "/dev/net/tun") and not c[0]]
+                 if c[1] in ("mihomo", "状态目录可写") and not c[0]]
     if _critical:
         for _ok, _name, _detail in _critical:
             print(f"✗ {_name}：{_detail}")
-        print("系统检查没过，隧道不会启动。先修上面几项，再跑 connect。")
+        print("系统检查没过，实例不会启动。先修上面几项，再跑 connect。")
         return
-    cleanup_legacy()
     need_update = False
     for region in REGIONS:
         files = region_files(region)
-        if not os.path.exists(files["ovpn"]):
+        if not os.path.exists(files["yaml"]):
             need_update = True
         elif os.path.exists(files["meta"]):
             try:
@@ -483,29 +549,23 @@ def cmd_connect(args):
             except Exception:
                 need_update = True
     if need_update:
-        cmd_update(args)
+        update_all(args)
     for region in REGIONS:
-        start_region(region)
-    print("两个隧道启动中，up 钩子会按地区自动写 fwmark 路由。"
-          "用 status 查看，用 tui 手动换出口。")
+        ok = start_region(region)
+        info = REGIONS[region]
+        print(f"{info['name']}：{'已启动' if ok else '启动失败，看日志 ' + region_files(region)['log']}"
+              f"（混合端口 {info['mixed_port']}，控制端口 {info['controller']}）")
+    print("用 status 查看当前出口，用 tui 手动换节点（回车即切，不用重启）。")
 
 
 def cmd_disconnect(_args):
     need_root()
     for region in REGIONS:
         stop_region(region)
-    cleanup_legacy()
-    print("两个隧道已停，fwmark 规则与路由表 201 / 202（及旧版 101 / 102）已清理。")
+    print("两个 Mihomo 实例已停。")
 
 
 def system_checks():
-    """系统检查：启动前必须过的项，返回 [(通过?, 名称, 说明)]。
-    专门解决“按了 s 但隧道没起来、连 jp.log 都不存在”的困惑：
-    日志文件只有 openvpn 真正启动后才会创建；如果 openvpn 没装、
-    没有 /dev/net/tun、没有配置文件，openvpn 根本没被拉起来，
-    日志当然不存在——这时应该先看 doctor，而不是去 tail 一个不存在的日志。
-    所以 start_region 在预检失败时，会把失败原因写进日志文件本身，
-    让 tail 日志也能看到原因，而不是文件缺失。"""
     import shutil
     checks = []
 
@@ -513,48 +573,38 @@ def system_checks():
         checks.append((bool(ok), name, detail))
 
     add(os.geteuid() == 0, "root 权限", "当前是 root" if os.geteuid() == 0 else "当前不是 root，请用 sudo")
-    ovpn = shutil.which("openvpn")
-    if ovpn:
-        ver = run(["openvpn", "--version"]).stdout.splitlines()
-        add(True, "openvpn", (ver[0].strip() if ver else ovpn))
+    if os.path.exists(MIHOMO_BIN):
+        ver = run([MIHOMO_BIN, "-v"]).stdout.splitlines()
+        add(True, "mihomo", (ver[0].strip() if ver else MIHOMO_BIN))
     else:
-        add(False, "openvpn", "未安装：跑安装脚本（apt 装 openvpn）或手动装 openvpn")
-    add(os.path.exists("/dev/net/tun"), "/dev/net/tun", "存在" if os.path.exists("/dev/net/tun") else "不存在：内核/容器没给 tun 设备，隧道起不来")
-    for cmd in ("ip", "iptables", "ping"):
-        add(shutil.which(cmd) is not None, f"命令 {cmd}", "已安装" if shutil.which(cmd) else "未安装")
+        add(False, "mihomo", f"未安装：{MIHOMO_BIN} 不存在，跑安装脚本（它会下载 Mihomo {MIHOMO_VERSION}）")
+    add(shutil.which("ping") is not None, "命令 ping", "已安装" if shutil.which("ping") else "未安装（本地延迟实测会回落 TCP）")
+    add(shutil.which("curl") is not None, "命令 curl", "已安装" if shutil.which("curl") else "未安装")
     try:
         os.makedirs(STATE_DIR, exist_ok=True)
         open(os.path.join(STATE_DIR, ".wtest"), "w").close()
         add(True, "状态目录可写", STATE_DIR)
     except Exception as e:
         add(False, "状态目录可写", f"{STATE_DIR} 写不进去：{e}")
-    # 路由表名（install.sh 会写 /etc/iproute2/rt_tables）
-    try:
-        rt = open("/etc/iproute2/rt_tables").read() if os.path.exists("/etc/iproute2/rt_tables") else ""
-        add("201 vgjp" in rt and "202 vgkr" in rt, "路由表名 vgjp/vgkr",
-            "已注册" if ("201 vgjp" in rt and "202 vgkr" in rt) else "未注册：ip rule 会显示数字 201/202 而不是 vgjp/vgkr，功能不受影响，重装一次可补")
-    except Exception as e:
-        add(False, "路由表名 vgjp/vgkr", str(e))
     for region, info in REGIONS.items():
         files = region_files(region)
-        add(os.path.exists(files["ovpn"]), f"{info['name']} 配置文件",
-            files["ovpn"] if os.path.exists(files["ovpn"]) else "不存在：先跑 connect 或在 TUI 按 s（新版 s 会自动生成）")
-        add(os.path.exists(files["meta"]), f"{info['name']} 元数据",
-            "存在" if os.path.exists(files["meta"]) else "不存在")
+        add(os.path.exists(files["yaml"]), f"{info['name']} Mihomo 配置",
+            files["yaml"] if os.path.exists(files["yaml"]) else "不存在：先跑 connect 生成")
         pid = pid_running(region)
-        add(pid is not None, f"{info['name']} 隧道进程",
+        add(pid is not None, f"{info['name']} 实例进程",
             f"运行中 pid={pid}" if pid else "未运行")
-        add(run(["id", info["user"]]).returncode == 0, f"{info['name']} 运行用户 {info['user']}",
-            "存在" if run(["id", info["user"]]).returncode == 0 else "不存在：启动时会自动建")
+        cur = api_current(region) if pid else None
+        add(cur is not None, f"{info['name']} 控制端口 {info['controller']}",
+            f"可达，当前节点 {cur}" if cur else "不可达（实例没起或还没就绪）")
         if os.path.exists(files["log"]):
             add(True, f"{info['name']} 日志", files["log"])
         else:
             add(False, f"{info['name']} 日志",
-                "不存在：openvpn 还没真正启动过——先看上面 openvpn / tun / 配置三项，缺哪项补哪项")
+                "不存在：实例还没真正启动过——先看上面 mihomo / 配置两项")
     return checks
 
 
-CRITICAL_CHECKS = {"root 权限", "openvpn", "/dev/net/tun", "命令 ip", "命令 iptables", "状态目录可写"}
+CRITICAL_CHECKS = {"root 权限", "mihomo", "状态目录可写"}
 
 
 def cmd_doctor(_args):
@@ -567,14 +617,10 @@ def cmd_doctor(_args):
             mark = "✗"
             bad += 1
         else:
-            # 配置 / 进程 / 用户 / 日志 / 表名没过不是“系统坏了”，
-            # 只是还没连过：配置由 connect 生成，用户启动时自动建，
-            # 隧道没起日志当然没有。用 ○ 区分，别把 12 项都算成故障。
             mark = "○"
         print(f"{mark} {name}：{detail}")
     if bad:
-        print(f"\n系统检查：{bad} 项关键问题。先修上面带 ✗ 的项再启动，"
-              f"否则隧道起不来、日志也不会有。○ 是“还没连过”，不是故障。")
+        print(f"\n系统检查：{bad} 项关键问题。先修上面带 ✗ 的项再启动。○ 是“还没连过”，不是故障。")
         return 1
     print("\n系统检查：关键项全部通过，可以启动。○ 是“还没连过”，不是故障。")
     return 0
@@ -583,33 +629,65 @@ def cmd_doctor(_args):
 def cmd_status(_args):
     for region, info in REGIONS.items():
         meta = load_json(region_files(region)["meta"], {})
-        print(f"{info['name']} {info['code']}: {meta.get('fqdn', '（无）')} "
-              f"{meta.get('ip', '')} 模式={meta.get('mode', '-')} "
+        cur = api_current(region) if pid_running(region) else None
+        print(f"{info['name']} {info['code']}: 当前节点={cur or meta.get('fqdn', '（无）')} "
+              f"IP={meta.get('ip', '')} 模式={meta.get('mode', '-')} "
               f"pid={pid_running(region) or '未运行'} "
-              f"fwmark={info['mark']} 表={info['table']} 隧道={info['dev']}")
-        print(run(["ip", "route", "show", "table", str(info["table"])]).stdout
-              or "  路由表空")
+              f"混合端口={info['mixed_port']} 控制端口={info['controller']} 组={info['group']}")
+
+
+def switch_region(region, server):
+    """切一个地区的出口。优先 API 即切（实例在跑且节点已在配置里）；
+    API 切不动就走更新重启全套，保证最终状态是对的。"""
+    if pid_running(region) and api_switch(region, proxy_name(server)):
+        meta = load_json(region_files(region)["meta"], {})
+        meta.update({k: v for k, v in server.items() if k != "config_b64"})
+        meta["mode"] = "manual"
+        with open(region_files(region)["meta"], "w") as f:
+            json.dump(meta, f, ensure_ascii=False, indent=2)
+        return True
+    # API 路径走不通：重新拉取生成配置，启动后再切一次
+    try:
+        grouped = candidates_by_region(parse_servers(fetch_csv()))
+        srv, _ = choose_for_region(region, grouped, load_json(MANUAL_FILE, {}))
+        if srv:
+            save_region(region, grouped[region], "manual" if region in load_json(MANUAL_FILE, {}) else "auto")
+            stop_region(region)
+            time.sleep(1)
+            if start_region(region):
+                return api_switch(region, proxy_name(srv))
+    except Exception:
+        pass
+    return False
 
 
 def cmd_set(args):
-    """命令行手动指定：--server <主机名> 或 --auto。"""
     need_root()
     region = args.region
     manual = load_json(MANUAL_FILE, {})
     if args.auto:
         manual.pop(region, None)
-        print(f"{REGIONS[region]['name']}已恢复自动选择，下次 update 生效。")
+        print(f"{REGIONS[region]['name']}已恢复自动选择。")
     else:
         manual[region] = args.server
-        print(f"{REGIONS[region]['name']}已手动指定为 {args.server}，"
-              "正在拉取列表并切换（若该服务器已下线会回落自动）。")
+        print(f"{REGIONS[region]['name']}已手动指定为 {args.server}，正在切换。")
     with open(MANUAL_FILE, "w") as f:
         json.dump(manual, f, ensure_ascii=False, indent=2)
-    grouped = cmd_update(args)
-    # 只重启被手动改动的地区
-    stop_region(region)
-    time.sleep(2)
-    start_region(region)
+    grouped = candidates_by_region(parse_servers(fetch_csv()))
+    srv, mode = choose_for_region(region, grouped, manual)
+    if not srv:
+        print("该服务器不在当前列表，切换失败（可能已下线）。")
+        return
+    if args.auto:
+        # 自动：切到列表最优，并把配置里手动顺序恢复（下次 update 生效）
+        ok = switch_region(region, srv) if pid_running(region) else False
+        if not ok:
+            update_all(args)
+            start_region(region)
+    else:
+        ok = switch_region(region, srv)
+        print(f"{REGIONS[region]['name']}切换{'成功' if ok else '失败'}：{srv['ip']}（{srv['fqdn']}）"
+              f"{'' if ok else '，看日志 ' + region_files(region)['log']}")
 
 
 def cmd_run(args):
@@ -621,60 +699,62 @@ def cmd_run(args):
         sys.exit("用法：run --region jp -- <命令>，例如 run --region jp -- curl -s ifconfig.me")
     if not pid_running(region):
         cmd_connect(args)
-        time.sleep(3)
-    user = REGIONS[region]["user"]
-    runner = "runuser" if run(["which", "runuser"]).returncode == 0 else "su"
-    if runner == "runuser":
-        cmd = ["runuser", "-u", user, "--"] + args.command
-    else:
-        cmd = ["su", user, "-s", "/bin/sh", "-c", " ".join(args.command)]
-    sys.exit(subprocess.call(cmd))
+        time.sleep(2)
+    port = REGIONS[region]["mixed_port"]
+    env = dict(os.environ)
+    env.update({
+        "http_proxy": f"http://127.0.0.1:{port}",
+        "https_proxy": f"http://127.0.0.1:{port}",
+        "HTTP_PROXY": f"http://127.0.0.1:{port}",
+        "HTTPS_PROXY": f"http://127.0.0.1:{port}",
+        "all_proxy": f"socks5://127.0.0.1:{port}",
+        "ALL_PROXY": f"socks5://127.0.0.1:{port}",
+        "no_proxy": "localhost,127.0.0.1",
+        "NO_PROXY": "localhost,127.0.0.1",
+    })
+    # sudo 进来的话，程序本身别用 root 跑（浏览器等尤其不能 root），
+    # 回到原来那个用户；没有 SUDO_USER 就按当前用户跑。
+    sudo_user = os.environ.get("SUDO_USER")
+    if os.geteuid() == 0 and sudo_user and sudo_user != "root":
+        if run(["which", "runuser"]).returncode == 0:
+            cmd = ["runuser", "-u", sudo_user, "--", "env"] + [
+                f"{k}={v}" for k, v in env.items()
+                if k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                         "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY")] + args.command
+            # runuser + env 会丢失其它环境变量，但代理变量已带上，够用。
+            sys.exit(subprocess.call(cmd))
+        cmd = ["su", sudo_user, "-s", "/bin/sh", "-c",
+               " ".join(f"{k}={v}" for k, v in env.items()
+                        if k in ("http_proxy", "https_proxy", "HTTP_PROXY", "HTTPS_PROXY",
+                                 "all_proxy", "ALL_PROXY", "no_proxy", "NO_PROXY"))
+               + " " + " ".join(args.command)]
+        sys.exit(subprocess.call(cmd))
+    sys.exit(subprocess.call(args.command, env=env))
 
 
 def cmd_watch(args):
     need_root()
-    before = {r: load_json(region_files(r)["meta"], {}).get("fqdn")
-              for r in REGIONS}
-    grouped = None
+    before = {r: load_json(region_files(r)["meta"], {}).get("fqdn") for r in REGIONS}
     try:
-        grouped = cmd_update(args)
+        update_all(args)
     except SystemExit:
-        grouped = None
-    if grouped is None:
         return
     for region in REGIONS:
-        after = load_json(region_files(region)["meta"], {}).get("fqdn")
         if not pid_running(region):
             start_region(region)
-        elif before.get(region) != after:
-            stop_region(region)
-            time.sleep(2)
-            start_region(region)
-    print("watch 检查完成：手动指定的地区不会被自动换服。")
+    print(f"watch 检查完成：手动指定的地区不会被自动换服（更新前 {before}）。")
 
 
 # ---------------- IP 信誉检查 ----------------
-# 说明：ipleak.net 这类网站是“泄漏测试”网页，没有公开 API，不适合程序调用。
-# 这里用的是可程序调用的免费源，外加两个可选的付费 Key（有 Key 才查）：
-#   免费：ip-api.com（国家/ISP/是否代理/是否机房/是否移动网络）
-#         proxycheck.io（风险分 0~100，无需 Key，只用 vpn=1&risk=1 这一组参数）
-#         getipintel（欺诈分 0~1，仅当设置了 VG_CONTACT_EMAIL 时才查）
-#   可选：AbuseIPDB（环境变量 ABUSEIPDB_KEY，滥用分 0~100）
-#         IPQualityScore（环境变量 IPQS_KEY，欺诈分 0~100）
-# 2026-11-04 实测到的故障：getipintel 对 example.com 这类占位邮箱返回
-# status=error、result=-5（“IP 被封 / 邮箱无效”），旧代码把这个错误悄悄
-# 吞掉，欺诈分就显示 None，用户完全不知道为什么。现在修复为：
-#   1. 不再用 example.com 当 contact；没设置真实邮箱就不调 getipintel，
-#      并在结果里明说原因，不再静默失败。
-#   2. 默认欺诈分改走 proxycheck.io，它无需 Key 就能返回 risk 分。
-#   3. 代理 / 机房标记不再单独决定风险：VPN 出口本来就是代理/机房，
-#      只看欺诈分 / 滥用分 / proxycheck 风险分。
-# 所谓“IP 纯净度”没有统一标准，这里给的是多源综合参考，不是官方判决。
+# 免费源：ip-api.com、proxycheck.io（默认欺诈分，vpn=1&risk=1 查两次取最高，
+# 因为免费端点对同一 IP 有时回 66 有时回 0）；getipintel 仅当设置了真实
+# VG_CONTACT_EMAIL 时才查，example.com 占位邮箱会被它封并返回 error/-5。
+# 可选 Key：ABUSEIPDB_KEY、IPQS_KEY。代理 / 机房不再单独定风险：
+# VPN 出口本来就是代理 / 机房，只看欺诈分 / 滥用分。
+# 走法：--via jp/kr 时信誉请求走该地区 Mihomo 的混合端口（HTTP 代理），
+# 实例没起就回落直连；也可以用 VG_PROXY / --proxy 指定其它 HTTP 代理。
 
 REPUTATION_CACHE_TTL = 24 * 3600
-# 缓存版本号：旧版（v1）缓存里欺诈分就是 None，而且没有 fraud_source /
-# fraud_error 字段。如果升级后还信任它，用户不加 --force 就会永远看到
-# 旧的 None，哪怕新代码已经能查出分数。所以 v1 缓存一律视为过期重查。
 REPUTATION_CACHE_VERSION = 2
 
 
@@ -689,88 +769,29 @@ def reputation_cache_path():
         return os.path.join(d, "reputation.json")
 
 
-def _marked_connect(host, port, timeout, mark):
-    """建一个打了 fwmark 的 socket：先 set SO_MARK 再 connect，
-    这样内核查路由表时就会走对应地区的表（201 日本 / 202 韩国），
-    请求就从该地区的 VPN 隧道出去，不用再搭一个 HTTP 代理。
-    SO_MARK = 36（Linux）。"""
-    import socket
-    last = None
-    for family, socktype, proto, _canon, sockaddr in socket.getaddrinfo(
-            host, port, 0, socket.SOCK_STREAM):
-        sock = socket.socket(family, socktype, proto)
-        try:
-            sock.setsockopt(socket.SOL_SOCKET, 36, mark)
-            sock.settimeout(timeout)
-            sock.connect(sockaddr)
-            return sock
-        except Exception as e:
-            last = e
-            sock.close()
-    raise last or OSError("marked connect failed")
-
-
-def fetch_json(url, headers=None, timeout=15, proxy=None, mark=None):
-    """查 JSON 接口。
-    走法按优先级：
-      1. proxy（VG_PROXY / --proxy）：走用户给的 HTTP 代理，备选。
-      2. mark（--via jp/kr 或 TUI 按地区自动给）：socket 打上该地区
-         的 fwmark，走已经连上的 VPN 隧道发出去。这是首选，不用多此一举
-         再搭 HTTP 代理——采集来的 VPN 本身就是代理。
-         注意：隧道没起来时，打了标记的流量在专用表里无路可走，
-         会失败；这时自动回落到直连一次，直连能通就用直连结果，
-         直连也被挡才算失败，不会因为隧道没起就直接报未知。
-      3. 都没有：直连（urllib 默认会读 HTTP_PROXY / HTTPS_PROXY）。
-    proxycheck / ip-api 查的是参数里的 IP，不是出口 IP，
-    所以走哪个隧道出，结果是一样的，区别只是“能不能发出去”。"""
-    req = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/2.0"})
+def fetch_json(url, headers=None, timeout=15, proxy=None, via_region=None):
+    """查 JSON 接口。proxy 优先级：显式 proxy > via 地区混合端口 >
+    VG_PROXY 环境变量；代理走不通回落直连一次（实例没起时就是这条路）。"""
+    if via_region in REGIONS:
+        proxy = f"http://127.0.0.1:{REGIONS[via_region]['mixed_port']}"
     proxy_url = proxy or os.environ.get("VG_PROXY")
+    req = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/3.0"})
     if proxy_url:
-        opener = urllib.request.build_opener(
-            urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
-        with opener.open(req, timeout=timeout) as resp:
-            return json.load(resp)
-    if mark is not None:
-        import http.client
-
-        class _MarkedHTTP(http.client.HTTPConnection):
-            def connect(self):
-                self.sock = _marked_connect(self.host, self.port or 80, self.timeout, mark)
-
-        class _MarkedHTTPS(http.client.HTTPSConnection):
-            def connect(self):
-                sock = _marked_connect(self.host, self.port or 443, self.timeout, mark)
-                self.sock = self._context.wrap_socket(sock, server_hostname=self.host)
-
-        class _HTTPHandler(urllib.request.HTTPHandler):
-            def http_open(self, req):
-                return self.do_open(_MarkedHTTP, req)
-
-        class _HTTPSHandler(urllib.request.HTTPSHandler):
-            def https_open(self, req):
-                return self.do_open(_MarkedHTTPS, req)
-
-        opener = urllib.request.build_opener(_HTTPHandler(), _HTTPSHandler())
         try:
+            opener = urllib.request.build_opener(
+                urllib.request.ProxyHandler({"http": proxy_url, "https": proxy_url}))
             with opener.open(req, timeout=timeout) as resp:
                 return json.load(resp)
-        except Exception as marked_err:
-            # 隧道没起 / 隧道断了 / 容器里没 CAP_NET_ADMIN 打不了标记：
-            # 回落直连一次。注意不能复用同一个 Request 对象，
-            # 实测复用会在直连时 RemoteDisconnected，必须新建一个。
-            try:
-                req2 = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/2.0"})
-                with urllib.request.urlopen(req2, timeout=timeout) as resp:
-                    return json.load(resp)
-            except Exception:
-                raise marked_err
+        except Exception:
+            # 代理没起 / 被挡：回落直连，别因为实例没起就直接报未知。
+            req2 = urllib.request.Request(url, headers=headers or {"User-Agent": "vpngate-fwmark/3.0"})
+            with urllib.request.urlopen(req2, timeout=timeout) as resp:
+                return json.load(resp)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp)
 
 
-def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None):
-    if via_region in REGIONS:
-        mark = int(REGIONS[via_region]["mark"], 16)
+def check_ip_reputation(ip, force=False, proxy=None, via_region=None):
     cache_path = reputation_cache_path()
     cache = load_json(cache_path, {})
     if not force and ip in cache:
@@ -779,15 +800,14 @@ def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None)
                 and time.time() - entry.get("checked_at", 0) < REPUTATION_CACHE_TTL):
             entry["cached"] = True
             return entry
-        # 旧版缓存：不信任，直接往下重查（不删除文件，重查后会被覆盖）。
     result = {"ip": ip, "country": "", "isp": "", "org": "", "asn": "",
               "proxy": None, "hosting": None, "mobile": None,
               "fraud_score": None, "abuse_score": None, "sources": [],
               "fraud_source": "", "fraud_error": "", "proxy_type": "",
               "cache_version": REPUTATION_CACHE_VERSION}
-    # ip-api.com：免费，限速约 45 次/分钟，查候选时不要一次查太多。
     try:
-        d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query", proxy=proxy, mark=mark)
+        d = fetch_json(f"http://ip-api.com/json/{ip}?fields=status,message,country,isp,org,as,proxy,hosting,mobile,query",
+                       proxy=proxy, via_region=via_region)
         if d.get("status") == "success":
             result.update({"country": d.get("country", ""), "isp": d.get("isp", ""),
                            "org": d.get("org", ""), "asn": d.get("as", ""),
@@ -796,16 +816,11 @@ def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None)
             result["sources"].append("ip-api.com")
     except Exception:
         pass
-    # proxycheck.io：默认欺诈分来源，无需 Key。用且只用 vpn=1&risk=1，
-    # 多加 asn/port/seen 等参数时实测会返回不一致的结果，所以不加。
-    # 另外实测发现：同一 IP 连查几次，免费端点有时返回 risk 66（Shadowsocks），
-    # 有时返回 risk 0（Business），疑似后端负载均衡不一致。安全起见查两次取最高分，
-    # 宁可把可疑的往高了算，也不让一次偶然的 0 把风险洗白。结果缓存 24 小时，
-    # 不会每次都翻倍消耗免费额度。
     try:
         best = None
         for _ in range(2):
-            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1", proxy=proxy, mark=mark)
+            d = fetch_json(f"https://proxycheck.io/v2/{ip}?vpn=1&risk=1",
+                           proxy=proxy, via_region=via_region)
             entry = d.get(ip) if isinstance(d, dict) else None
             if d.get("status") == "ok" and isinstance(entry, dict) and entry.get("risk") is not None:
                 if best is None or float(entry["risk"]) > float(best["risk"]):
@@ -819,18 +834,16 @@ def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None)
             result["sources"].append("proxycheck")
     except Exception as e:
         result["fraud_error"] = f"proxycheck 失败：{e}"
-    # getipintel：仅当用户设置了真实联系邮箱时才查。
-    # 占位邮箱（example.com）会被它判定为无效并封 IP，返回 error/-5，
-    # 这就是之前欺诈分突然变 None 的直接原因。
     contact = os.environ.get("VG_CONTACT_EMAIL", "").strip()
     if contact and "@" in contact and not contact.endswith("@example.com"):
         try:
             import urllib.parse
             d = fetch_json("https://check.getipintel.net/check.php?ip="
-                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json", proxy=proxy, mark=mark)
+                           f"{ip}&contact={urllib.parse.quote(contact)}&format=json",
+                           proxy=proxy, via_region=via_region)
             if d.get("status") == "success":
                 score = float(d.get("result"))
-                if score >= 0:  # 负数是错误码（-5 等），不是分数
+                if score >= 0:
                     if result["fraud_score"] is None or score > result["fraud_score"]:
                         result["fraud_score"] = score
                     result["fraud_source"] = (result["fraud_source"] + "+getipintel").strip("+")
@@ -842,22 +855,22 @@ def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None)
         except Exception as e:
             result["fraud_error"] = f"getipintel 失败：{e}"
     elif not result["fraud_error"]:
-        result["fraud_error"] = "getipintel 未调用：请设置 VG_CONTACT_EMAIL 为你的真实邮箱（它要求真实联系邮箱）"
-    # 可选：AbuseIPDB
+        result["fraud_error"] = "getipintel 未调用：请设置 VG_CONTACT_EMAIL 为你的真实邮箱"
     key = os.environ.get("ABUSEIPDB_KEY")
     if key:
         try:
             d = fetch_json(f"https://api.abuseipdb.com/api/v2/check?ipAddress={ip}&maxAgeInDays=90",
-                           headers={"Key": key, "Accept": "application/json"}, proxy=proxy, mark=mark)
+                           headers={"Key": key, "Accept": "application/json"},
+                           proxy=proxy, via_region=via_region)
             result["abuse_score"] = int(d["data"]["abuseConfidenceScore"])
             result["sources"].append("AbuseIPDB")
         except Exception:
             pass
-    # 可选：IPQualityScore（取多源中的最高分，不静默覆盖）
     key = os.environ.get("IPQS_KEY")
     if key:
         try:
-            d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}", proxy=proxy, mark=mark)
+            d = fetch_json(f"https://ipqualityscore.com/api/json/ip/{key}/{ip}",
+                           proxy=proxy, via_region=via_region)
             if d.get("success"):
                 score = float(d.get("fraud_score", 0)) / 100.0
                 if result["fraud_score"] is None or score > result["fraud_score"]:
@@ -868,7 +881,6 @@ def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None)
             pass
     fraud = result["fraud_score"]
     abuse = result["abuse_score"]
-    # 代理/机房不再单独定风险：VPN 出口本来就是代理/机房，只看分数。
     if (abuse is not None and abuse >= 75) or (fraud is not None and fraud >= 0.9):
         risk = "高"
     elif (abuse is not None and abuse >= 50) or (fraud is not None and fraud >= 0.7):
@@ -878,9 +890,6 @@ def check_ip_reputation(ip, force=False, proxy=None, mark=None, via_region=None)
     else:
         risk = "未知（免费源未返回分数，仅看国家/ISP/机房标记）"
     result["risk"] = risk
-    # 没查到分数的“未知”结果别缓存 24 小时：隧道没起时直连被挡会
-    # 留下未知，隧道起来后 5 分钟内就应该能重查走隧道，而不是等一天。
-    # 做法是把 checked_at 往前推，只留 5 分钟有效期。
     if fraud is None and abuse is None:
         result["checked_at"] = int(time.time()) - REPUTATION_CACHE_TTL + 300
     else:
@@ -914,10 +923,9 @@ def cmd_reputation(args):
                               via_region=getattr(args, "via", None))
     via = getattr(args, "via", None)
     if via:
-        print(f"（信誉请求走 {REGIONS[via]['name']} 隧道发出去，隧道没起时自动回落直连）")
+        print(f"（信誉请求走 {REGIONS[via]['name']} Mihomo 混合端口 {REGIONS[via]['mixed_port']} 发出去，实例没起时自动回落直连）")
     print(format_reputation(rep))
-    print("提醒：机房 IP 对 VPN 出口来说是正常的，单独看机房标记不能判为脏 IP；"
-          "重点看欺诈分 / 滥用分是否高。")
+    print("提醒：机房 IP 对 VPN 出口来说是正常的，单独看机房标记不能判为脏 IP；重点看欺诈分 / 滥用分是否高。")
 
 
 # ---------------- TUI ----------------
@@ -930,7 +938,6 @@ def cmd_tui(_args):
         cands = load_json(CANDIDATES_FILE, {})
         if cands and any(cands.values()):
             return cands
-        # 旧 bug：拉取失败直接抛错，TUI 一打开就崩。现在返回空列表并让界面显示“暂无候选”。
         try:
             grouped = candidates_by_region(parse_servers(fetch_csv()))
         except Exception:
@@ -939,8 +946,6 @@ def cmd_tui(_args):
                      for s in grouped[r][:20]] for r in grouped}
 
     def safe_add(stdscr, y, x, text, attr=0):
-        """旧 TUI 的最大 bug：终端一窄、消息一长，addstr 就越界崩溃。
-        这里先按屏幕宽高截断，越界直接跳过，绝不让 curses 抛错。"""
         try:
             height, width = stdscr.getmaxyx()
         except Exception:
@@ -961,10 +966,6 @@ def cmd_tui(_args):
         else:
             cursor_dict[region] = max(0, min(cursor_dict[region], len(lst) - 1))
 
-    # TUI 每行后面的欺诈分：不能一打开就同步查 20 个节点，那会卡住界面
-    # 还会被免费接口限速。所以只查当前屏幕上显示的几行，后台线程查，
-    # 查到就填上；同时最多 3 个并发，避免一下子打爆 ip-api / proxycheck。
-    # 缓存 24 小时的结果进 TUI 就直接显示，不用重新联网。
     rep_scores = {}
     rep_pending = set()
     rep_lock = threading.Lock()
@@ -980,9 +981,6 @@ def cmd_tui(_args):
     except Exception:
         pass
 
-    # 本地延迟：和欺诈分一样，后台测、只测当前屏幕上的行，不卡界面。
-    # 这里显示的才是“你这台机器到 VPN 服务器”的延迟，CSV 里的 Ping
-    # 是 VPN Gate 公布值，不能当本地延迟用，所以 TUI 里不再直接用它。
     lat_scores = {}
     lat_pending = set()
     lat_lock = threading.Lock()
@@ -1036,8 +1034,6 @@ def cmd_tui(_args):
         def _work():
             try:
                 with rep_sem:
-                    # 该地区隧道在跑，就走该隧道发信誉请求（SO_MARK）；
-                    # 隧道没起就不打标记，直连（直连被挡时 5 分钟后可重查）。
                     via = region if region and pid_running(region) else None
                     rep = check_ip_reputation(ip, proxy=rep_proxy, via_region=via)
                 text = (f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
@@ -1059,8 +1055,7 @@ def cmd_tui(_args):
             height, width = stdscr.getmaxyx()
         except Exception:
             height, width = 24, 80
-        # 顶栏：短标题 + 状态色块，不再是一行超长中文导致小终端崩溃。
-        safe_add(stdscr, 0, 0, " vpngate-fwmark ".ljust(width), curses.color_pair(1) | curses.A_BOLD)
+        safe_add(stdscr, 0, 0, " vpngate-fwmark · Mihomo ".ljust(width), curses.color_pair(1) | curses.A_BOLD)
         row = 2
         for idx, region in enumerate(regions):
             info = REGIONS[region]
@@ -1071,7 +1066,7 @@ def cmd_tui(_args):
             status_attr = curses.color_pair(3) if running else curses.color_pair(4)
             arrow = "▶" if idx == sel_region else " "
             head = (f"{arrow} {info['name']} {info['code']}  "
-                    f"fwmark {info['mark']}  表 {info['table']}  {info['dev']}  [{mode}]")
+                    f"混合端口 {info['mixed_port']}  组 {info['group']}  [{mode}]")
             head_attr = curses.color_pair(2) | curses.A_BOLD if idx == sel_region else curses.A_BOLD
             safe_add(stdscr, row, 0, head, head_attr)
             safe_add(stdscr, row, max(0, width - 12), status, status_attr)
@@ -1080,17 +1075,15 @@ def cmd_tui(_args):
                      f"当前出口 IP：{meta.get('ip', '（无）')}（{meta.get('fqdn', '')}） "
                      f"{meta.get('speed_mbps', '')} Mbps / Ping {meta.get('ping', '')} ms")
             row += 1
-            # 地区卡片之间的分隔线，让两个地区一眼分开。
             safe_add(stdscr, row, 0, "─" * max(0, width - 1), curses.color_pair(5))
             row += 1
-        # 候选列表：按剩余高度算能显示几行，带滚动，绝不写出屏幕底部。
         footer_rows = 3
         avail = max(1, height - row - footer_rows - 1)
         region = regions[sel_region]
         lst = cands.get(region, [])
         clamp_cursor(cursor, region, lst)
         safe_add(stdscr, row, 0,
-                 f"候选服务器 · {REGIONS[region]['name']}（欺诈分在每行后面，后台自动查，p 查详情）",
+                 f"候选服务器 · {REGIONS[region]['name']}（回车即切节点，不用重启；欺诈分在每行后面，后台自动查，p 查详情）",
                  curses.A_BOLD)
         row += 1
         if not lst:
@@ -1111,7 +1104,6 @@ def cmd_tui(_args):
                          f"{s['speed_mbps']:>7} Mbps  {lat_text(s['ip'])}  {s['sessions']} 会话  {fraud_text(s['ip'])}",
                          attr)
                 row += 1
-        # 底栏：帮助分两行写，消息最多显示两行并截断。
         safe_add(stdscr, height - 3, 0, "─" * max(0, width - 1), curses.color_pair(5))
         safe_add(stdscr, height - 2, 0,
                  "Tab 切换地区  ↑/↓选服务器  回车手动指定  a 自动  p 信誉  r 刷新  s 启停  c 系统检查  l 看日志  q 退出")
@@ -1126,25 +1118,22 @@ def cmd_tui(_args):
             curses.curs_set(0)
         except Exception:
             pass
-        # 颜色：单色终端会失败，失败就退回无色，界面照样能用。
         try:
             curses.start_color()
             curses.use_default_colors()
-            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)   # 顶栏
-            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)   # 选中行
-            curses.init_pair(3, curses.COLOR_GREEN, -1)                  # 运行中
-            curses.init_pair(4, curses.COLOR_RED, -1)                    # 未运行
-            curses.init_pair(5, curses.COLOR_CYAN, -1)                   # 分隔线
+            curses.init_pair(1, curses.COLOR_WHITE, curses.COLOR_BLUE)
+            curses.init_pair(2, curses.COLOR_BLACK, curses.COLOR_CYAN)
+            curses.init_pair(3, curses.COLOR_GREEN, -1)
+            curses.init_pair(4, curses.COLOR_RED, -1)
+            curses.init_pair(5, curses.COLOR_CYAN, -1)
         except Exception:
             pass
         try:
             stdscr.timeout(500)
         except Exception:
             pass
-        # 启动时先系统检查：openvpn / tun 缺了，按 s 也起不来，
-        # 直接在底栏告诉用户，别让他对着一个不存在的日志发懵。
         _crit = [c for c in system_checks()
-                 if c[1] in ("openvpn", "/dev/net/tun") and not c[0]]
+                 if c[1] in ("mihomo", "状态目录可写") and not c[0]]
         regions = list(REGIONS.keys())
         sel = 0
         cursor = {r: 0 for r in regions}
@@ -1158,15 +1147,14 @@ def cmd_tui(_args):
         while True:
             key = stdscr.getch()
             if key == -1:
-                # 500ms 超时：没有按键也重画一次，让后台查到的欺诈分及时显示。
                 draw(stdscr, regions, sel, cursor, cands, manual, msg)
                 continue
             region = regions[sel]
             if key in (ord("q"), ord("Q")):
                 break
             elif key == curses.KEY_RESIZE:
-                pass  # 下一轮 draw 会按新尺寸重画，不再因旧尺寸越界
-            elif key == 9:  # Tab
+                pass
+            elif key == 9:
                 sel = (sel + 1) % len(regions)
             elif key in (curses.KEY_UP, ord("k")):
                 cursor[region] = max(0, cursor[region] - 1)
@@ -1178,26 +1166,35 @@ def cmd_tui(_args):
                 clamp_cursor(cursor, region, lst)
                 if lst:
                     chosen = lst[cursor[region]]
+                    # 先 API 即切：实例在跑且节点已在配置里，秒切不用重启。
+                    # API 切不动（实例没起 / 配置还是旧的）再走更新重启全套。
                     manual[region] = chosen["fqdn"]
                     with open(MANUAL_FILE, "w") as f:
                         json.dump(manual, f, ensure_ascii=False, indent=2)
-                    # 手动切换：需要完整配置数据，重新拉取一次。
-                    # 旧 bug：服务器不在列表时也先停了隧道，导致手动换服失败还断网。
-                    # 现在是先确认新服务器存在才停旧隧道。
-                    try:
-                        grouped = candidates_by_region(parse_servers(fetch_csv()))
-                        srv, _ = choose_for_region(region, grouped, manual)
-                    except Exception as e:
-                        srv = None
-                        msg = f"拉取列表失败，未切换：{e}"
-                    if srv:
-                        save_region(region, srv, "manual")
-                        stop_region(region)
-                        time.sleep(2)
-                        start_region(region)
-                        msg = f"{REGIONS[region]['name']}已手动切换到 {srv['ip']}（{srv['fqdn']}）。"
-                    elif "拉取列表失败" not in msg:
-                        msg = "该服务器已不在列表，切换失败，旧隧道未动。"
+                    if pid_running(region) and api_switch(region, proxy_name(chosen)):
+                        meta = load_json(region_files(region)["meta"], {})
+                        meta.update({k: v for k, v in chosen.items() if k != "config_b64"})
+                        meta["mode"] = "manual"
+                        with open(region_files(region)["meta"], "w") as f:
+                            json.dump(meta, f, ensure_ascii=False, indent=2)
+                        msg = f"{REGIONS[region]['name']}已手动切换到 {chosen['ip']}（{chosen['fqdn']}），API 即切。"
+                    else:
+                        try:
+                            grouped = candidates_by_region(parse_servers(fetch_csv()))
+                            srv, _ = choose_for_region(region, grouped, manual)
+                        except Exception as e:
+                            srv = None
+                            msg = f"拉取列表失败，未切换：{e}"
+                        if srv:
+                            save_region(region, grouped[region], "manual")
+                            stop_region(region)
+                            time.sleep(1)
+                            if start_region(region) and api_switch(region, proxy_name(srv)):
+                                msg = f"{REGIONS[region]['name']}已手动切换到 {srv['ip']}（{srv['fqdn']}）。"
+                            else:
+                                msg = f"{REGIONS[region]['name']}切换失败，看日志 {region_files(region)['log']}。"
+                        elif "拉取列表失败" not in msg:
+                            msg = "该服务器已不在列表，切换失败，旧实例未动。"
                 else:
                     msg = "暂无候选，按 r 刷新后再选。"
             elif key in (ord("a"), ord("A")):
@@ -1211,22 +1208,28 @@ def cmd_tui(_args):
                     srv = None
                     msg = f"拉取列表失败，未切换：{e}"
                 if srv:
-                    save_region(region, srv, "auto")
-                    stop_region(region)
-                    time.sleep(2)
-                    start_region(region)
-                    msg = f"{REGIONS[region]['name']}已恢复自动：{srv['ip']}（{srv['fqdn']}）。"
+                    if pid_running(region) and api_switch(region, proxy_name(srv)):
+                        msg = f"{REGIONS[region]['name']}已恢复自动：{srv['ip']}（{srv['fqdn']}）。"
+                    else:
+                        save_region(region, grouped[region], "auto")
+                        stop_region(region)
+                        time.sleep(1)
+                        start_region(region)
+                        msg = f"{REGIONS[region]['name']}已恢复自动：{srv['ip']}（{srv['fqdn']}）。"
                 elif "拉取列表失败" not in msg:
                     msg = "暂无候选，恢复自动失败。"
             elif key in (ord("r"), ord("R")):
                 try:
-                    grouped = candidates_by_region(parse_servers(fetch_csv()))
+                    class _A:  # update_all 只读 use_ip / check_reputation 两个属性
+                        use_ip = False
+                        check_reputation = False
+                    grouped = update_all(_A())
                     cands = {r: [{k: v for k, v in s.items() if k != "config_b64"}
                                  for s in grouped[r][:20]] for r in grouped}
                     for r in regions:
                         cands.setdefault(r, [])
                         clamp_cursor(cursor, r, cands[r])
-                    msg = "列表已刷新。"
+                    msg = "列表已刷新，在跑的实例已重启加载新配置。"
                 except Exception as e:
                     msg = f"刷新失败：{e}"
             elif key in (ord("p"), ord("P")):
@@ -1239,7 +1242,8 @@ def cmd_tui(_args):
                     try:
                         _ms, _m = measure_local_latency(chosen["ip"])
                         _local = f"{_ms:.0f} ms" if _ms is not None else "测不到"
-                        rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy, via_region=region if pid_running(region) else None)
+                        rep = check_ip_reputation(chosen["ip"], proxy=rep_proxy,
+                                                  via_region=region if pid_running(region) else None)
                         with rep_lock:
                             rep_scores[chosen["ip"]] = (
                                 f"欺诈 {rep['fraud_score']:.2f}" if rep.get("fraud_score") is not None
@@ -1253,7 +1257,6 @@ def cmd_tui(_args):
                 else:
                     msg = "暂无候选，按 r 刷新后再查。"
             elif key in (ord("c"), ord("C")):
-                # 全屏系统检查：底栏只有一行，检查结果放不下，必须全屏看。
                 stdscr.clear()
                 try:
                     _h, _w = stdscr.getmaxyx()
@@ -1275,8 +1278,6 @@ def cmd_tui(_args):
                 draw(stdscr, regions, sel, cursor, cands, manual, msg)
                 continue
             elif key in (ord("l"), ord("L")):
-                # 全屏看日志：只看选中地区最近 20 行；日志不存在就明说
-                # openvpn 还没启动过，而不是让用户去 tail 一个不存在的文件。
                 stdscr.clear()
                 try:
                     _h, _w = stdscr.getmaxyx()
@@ -1290,8 +1291,8 @@ def cmd_tui(_args):
                     except Exception as e:
                         _lines = [f"读日志失败：{e}"]
                 else:
-                    _lines = ["日志文件不存在：openvpn 还没真正启动过。",
-                              "先按 c 看系统检查（openvpn / tun / 配置缺哪项），",
+                    _lines = ["日志文件不存在：实例还没真正启动过。",
+                              "先按 c 看系统检查（mihomo / 配置缺哪项），",
                               "再按 s 启动；启动失败的原因也会写进这个日志文件。"]
                 _row = 2
                 for _ln in _lines:
@@ -1309,23 +1310,19 @@ def cmd_tui(_args):
             elif key in (ord("s"), ord("S")):
                 if pid_running(region):
                     stop_region(region)
-                    msg = f"{REGIONS[region]['name']}隧道已停止。"
+                    msg = f"{REGIONS[region]['name']}实例已停止。"
                 else:
-                    # 旧 bug：这里只在 ovpn 存在时才启动，不存在就让用户
-                    # “按 r 刷新”，但 r 只刷新内存里的候选列表，根本不生成
-                    # ovpn，所以按多少次 r 再按 s 还是连不上，死循环。
-                    # 现在 s 没配置就直接拉取一次、生成配置再启动。
-                    if not os.path.exists(region_files(region)["ovpn"]):
+                    if not os.path.exists(region_files(region)["yaml"]):
                         msg = f"{REGIONS[region]['name']}还没有配置文件，正在拉取生成……"
                         draw(stdscr, regions, sel, cursor, cands, manual, msg)
                         try:
                             grouped = candidates_by_region(parse_servers(fetch_csv()))
                             srv, _ = choose_for_region(region, grouped, manual)
                             if srv:
-                                save_region(region, srv, "manual" if region in manual else "auto")
+                                save_region(region, grouped[region], "manual" if region in manual else "auto")
                                 cands[region] = [{k: v for k, v in s.items() if k != "config_b64"}
                                                  for s in grouped[region][:20]]
-                                msg = f"{REGIONS[region]['name']}配置已生成（{srv['ip']}），正在启动隧道……"
+                                msg = f"{REGIONS[region]['name']}配置已生成（{srv['ip']}），正在启动实例……"
                             else:
                                 msg = f"{REGIONS[region]['name']}拉取列表为空，启动失败。"
                                 draw(stdscr, regions, sel, cursor, cands, manual, msg)
@@ -1335,17 +1332,17 @@ def cmd_tui(_args):
                             draw(stdscr, regions, sel, cursor, cands, manual, msg)
                             continue
                     import shutil as _shutil
-                    if _shutil.which("openvpn") is None:
-                        msg = f"{REGIONS[region]['name']}启动失败：本机没有 openvpn，先跑安装脚本装依赖。"
+                    if not os.path.exists(MIHOMO_BIN):
+                        msg = f"{REGIONS[region]['name']}启动失败：本机没有 mihomo，先跑安装脚本。"
                     elif start_region(region):
                         with rep_lock:
                             for _s in cands.get(region, []):
                                 rep_scores.pop(_s["ip"], None)
-                        msg = (f"{REGIONS[region]['name']}隧道启动中，稍等几秒看状态；"
+                        msg = (f"{REGIONS[region]['name']}实例启动中，稍等几秒看状态；"
                                f"若一直未运行，退出 TUI 看 /var/lib/vpngate-fwmark/{region}.log 末尾。")
                     else:
-                        msg = (f"{REGIONS[region]['name']}启动失败：openvpn 没起来，"
-                               f"退出 TUI 看 /var/lib/vpngate-fwmark/{region}.log 末尾（一般是服务器下线/认证/无 tun 设备）。")
+                        msg = (f"{REGIONS[region]['name']}启动失败，"
+                               f"退出 TUI 看 /var/lib/vpngate-fwmark/{region}.log 末尾。")
             draw(stdscr, regions, sel, cursor, cands, manual, msg)
 
     curses.wrapper(main_tui)
@@ -1372,7 +1369,7 @@ def main():
     sp.add_argument("--force", action="store_true", help="不用 24 小时缓存，强制重查")
     sp.add_argument("--proxy", default=None, help="备选：信誉请求走的 HTTP 代理，例如 http://127.0.0.1:7890；也可设 VG_PROXY 环境变量")
     sp.add_argument("--via", choices=list(REGIONS.keys()), default=None,
-                    help="首选：信誉请求走哪个地区的 VPN 隧道发出去（jp/kr），不用再搭 HTTP 代理；隧道没起时自动回落直连")
+                    help="首选：信誉请求走哪个地区的 Mihomo 混合端口发出去（jp/kr），实例没起时自动回落直连")
     sp = sub.add_parser("run")
     sp.add_argument("--region", choices=list(REGIONS.keys()), default="jp")
     sp.add_argument("command", nargs=argparse.REMAINDER)
@@ -1380,8 +1377,6 @@ def main():
     sp.add_argument("--region", choices=list(REGIONS.keys()), required=True)
     sp.add_argument("--server")
     sp.add_argument("--auto", action="store_true")
-    sub.add_parser("_up_hook")
-    sub.add_parser("_down_hook")
     args = p.parse_args()
     if args.action == "set" and not args.auto and not args.server:
         p.error("set 需要 --server <主机名> 或 --auto")
@@ -1390,7 +1385,6 @@ def main():
         "disconnect": cmd_disconnect, "status": cmd_status,
         "watch": cmd_watch, "run": cmd_run, "set": cmd_set, "tui": cmd_tui,
         "reputation": cmd_reputation, "ping": cmd_ping, "doctor": cmd_doctor,
-        "_up_hook": _up_hook, "_down_hook": _down_hook,
     }[args.action]
     rc = handler(args)
     if rc:
